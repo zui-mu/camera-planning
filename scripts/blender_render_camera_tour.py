@@ -67,7 +67,88 @@ def add_path_curve(points):
     bpy.context.scene.collection.objects.link(obj)
 
 
-def planned_samples(path_plan, rig, fps, seconds_per_leg):
+def _hermite_point(a, b, tangent_a, tangent_b, u):
+    """Interpolating cubic used for one control-polyline segment."""
+    u2, u3 = u * u, u * u * u
+    return (
+        (2 * u3 - 3 * u2 + 1) * a
+        + (u3 - 2 * u2 + u) * tangent_a
+        + (-2 * u3 + 3 * u2) * b
+        + (u3 - u2) * tangent_b
+    )
+
+
+def _curve_segments(points, smoothing_strength, dense_count=33):
+    """Return dense C1 Hermite segments through every certified polyline vertex.
+
+    ``smoothing_strength=None`` is the exact piecewise-linear safety fallback.
+    Non-zero strengths share one tangent at each interior vertex, so the camera
+    passes through waypoints without stopping or changing direction abruptly.
+    """
+    if len(points) < 2:
+        raise ValueError("tour curve requires at least two control points")
+    if smoothing_strength is None:
+        return [[a, b] for a, b in itertools.pairwise(points)]
+    tangents = []
+    for index, point in enumerate(points):
+        if index == 0:
+            tangent = points[1] - point
+        elif index == len(points) - 1:
+            tangent = point - points[index - 1]
+        else:
+            tangent = (points[index + 1] - points[index - 1]) * 0.5
+        tangents.append(tangent * smoothing_strength)
+    parameters = [index / (dense_count - 1) for index in range(dense_count)]
+    return [
+        [
+            _hermite_point(points[index], points[index + 1], tangents[index],
+                           tangents[index + 1], u)
+            for u in parameters
+        ]
+        for index in range(len(points) - 1)
+    ]
+
+
+def _polyline_length(points):
+    return sum((b - a).length for a, b in itertools.pairwise(points))
+
+
+def _allocate_intervals(lengths, total_intervals):
+    """Allocate integer frame intervals by arc length, at least one per segment."""
+    if total_intervals < len(lengths):
+        total_intervals = len(lengths)
+    total = max(sum(lengths), 1e-12)
+    raw = [length / total * (total_intervals - len(lengths)) for length in lengths]
+    counts = [1 + int(math.floor(value)) for value in raw]
+    remaining = total_intervals - sum(counts)
+    order = sorted(range(len(raw)), key=lambda i: raw[i] - math.floor(raw[i]), reverse=True)
+    for index in order[:remaining]:
+        counts[index] += 1
+    return counts
+
+
+def _arc_samples(points, intervals):
+    """Sample one dense polyline at nearly equal arc-length spacing."""
+    if intervals <= 0:
+        raise ValueError("arc sampling needs a positive interval count")
+    lengths = [(b - a).length for a, b in itertools.pairwise(points)]
+    total = sum(lengths)
+    if total <= 1e-12:
+        return [points[0].copy() for _ in range(intervals + 1)]
+    cumulative = [0.0]
+    for length in lengths:
+        cumulative.append(cumulative[-1] + length)
+    result, edge = [], 0
+    for distance in (total * index / intervals for index in range(intervals + 1)):
+        while edge + 1 < len(lengths) and distance > cumulative[edge + 1]:
+            edge += 1
+        length = lengths[edge]
+        u = 0.0 if length <= 1e-12 else (distance - cumulative[edge]) / length
+        result.append(points[edge].lerp(points[edge + 1], min(1.0, max(0.0, u))))
+    return result
+
+
+def planned_samples(path_plan, rig, fps, seconds_per_leg, smoothing_strength=1.0):
     if path_plan.get("status") != "planned" or path_plan.get("closed"):
         raise ValueError("path-plan must contain a successful open path")
     rig_hash = hashlib.sha256(
@@ -81,7 +162,9 @@ def planned_samples(path_plan, rig, fps, seconds_per_leg):
         raise ValueError("path-plan must visit every selected camera exactly once")
     if [(leg["from"], leg["to"]) for leg in path_plan["legs"]] != list(itertools.pairwise(ids)):
         raise ValueError("path-plan legs do not match open visit order")
-    result, arrivals = [], [{"camera_id": ids[0], "frame": 1}]
+    controls = []
+    segment_labels = []
+    arrival_controls = {0: ids[0]}
     for leg in path_plan["legs"]:
         left, right = camera_world(specs[leg["from"]]), camera_world(specs[leg["to"]])
         points = [Vector(point) for point in leg["points"]]
@@ -91,34 +174,84 @@ def planned_samples(path_plan, rig, fps, seconds_per_leg):
             or (points[-1] - right.translation).length > 1e-6
         ):
             raise ValueError("path endpoints differ from selected cameras")
-        lengths = [(b - a).length for a, b in itertools.pairwise(points)]
-        total = sum(lengths)
-        traveled = 0.0
-        for (a, b), length in zip(itertools.pairwise(points), lengths):
-            count = max(2, round(fps * seconds_per_leg * length / max(total, 1e-9)))
-            for step in range(0 if not result else 1, count + 1):
-                u = step / count
-                t = u**3 * (10 - 15 * u + 6 * u * u)
-                position = a.lerp(b, t)  # stays on the certified segment
-                progress = (traveled + t * length) / max(total, 1e-9)
-                rotation = left.to_quaternion().slerp(right.to_quaternion(), progress)
-                if path_plan.get("orientation_policy") == "look_at_fixed_target_aim":
-                    forward = (Vector(path_plan["focus_world_m"]) - position).normalized()
-                    right_axis = forward.cross(Vector(path_plan["world_up"])).normalized()
-                    up_axis = right_axis.cross(forward).normalized()
-                    rotation = Matrix((right_axis, up_axis, -forward)).transposed().to_quaternion()
-                result.append(
-                    {
-                        "frame": len(result) + 1,
-                        "position": list(position),
-                        "rotation": list(rotation),
-                        "from": leg["from"],
-                        "to": leg["to"],
-                    }
+        if not controls:
+            controls.append(points[0])
+        elif (controls[-1] - points[0]).length > 1e-6:
+            raise ValueError("adjacent path legs are disconnected")
+        for point in points[1:]:
+            controls.append(point)
+            segment_labels.append((leg["from"], leg["to"]))
+        arrival_controls[len(controls) - 1] = leg["to"]
+
+    dense_segments = _curve_segments(controls, smoothing_strength)
+    lengths = [_polyline_length(points) for points in dense_segments]
+    # Preserve the old duration contract, but spend it continuously over the
+    # complete path rather than restarting an ease curve at every waypoint.
+    total_intervals = max(1, round(fps * seconds_per_leg * (len(ids) - 1)))
+    interval_counts = _allocate_intervals(lengths, total_intervals)
+    result, arrivals = [], []
+    for control_index, (dense, count, label) in enumerate(
+        zip(dense_segments, interval_counts, segment_labels, strict=True)
+    ):
+        positions = _arc_samples(dense, count)
+        for position in positions[0 if not result else 1 :]:
+            if path_plan.get("orientation_policy") == "look_at_fixed_target_aim":
+                forward = (Vector(path_plan["focus_world_m"]) - position).normalized()
+                right_axis = forward.cross(Vector(path_plan["world_up"])).normalized()
+                up_axis = right_axis.cross(forward).normalized()
+                rotation = Matrix((right_axis, up_axis, -forward)).transposed().to_quaternion()
+            else:
+                progress = control_index / max(len(controls) - 1, 1)
+                rotation = camera_world(specs[ids[0]]).to_quaternion().slerp(
+                    camera_world(specs[ids[-1]]).to_quaternion(), progress
                 )
-            traveled += length
-        arrivals.append({"camera_id": leg["to"], "frame": len(result)})
+            result.append({
+                "frame": len(result) + 1,
+                "position": list(position),
+                "rotation": list(rotation),
+                "from": label[0],
+                "to": label[1],
+            })
+        endpoint_control = control_index + 1
+        if endpoint_control in arrival_controls:
+            arrivals.append({
+                "camera_id": arrival_controls[endpoint_control],
+                "frame": len(result),
+            })
+    arrivals.insert(0, {"camera_id": ids[0], "frame": 1})
     return [specs[i] for i in ids], result, arrivals
+
+
+def collision_failures(samples, request):
+    allowed = request["allowed_camera_region"]
+    clearance = float(request["candidates"]["camera_clearance_m"])
+    failures = []
+    for sample in samples:
+        point = sample["position"]
+        if not inside(point, allowed["minimum"], allowed["maximum"], -clearance):
+            failures.append({"frame": sample["frame"], "object_id": "outside mark"})
+        for obstacle in [request["target"], *request["obstacles"]]:
+            if inside(point, obstacle["minimum"], obstacle["maximum"], clearance):
+                failures.append({"frame": sample["frame"], "object_id": obstacle["object_id"]})
+    return failures
+
+
+def mesh_view_failures(samples, specs, evaluator):
+    from mathutils import Quaternion
+
+    failures = []
+    for sample in samples:
+        rotation = (
+            Matrix.Diagonal((1.0, -1.0, -1.0))
+            @ Quaternion(sample["rotation"]).to_matrix().transposed()
+        )
+        translation = -(rotation @ Vector(sample["position"]))
+        check = evaluator.check(
+            {**specs[0], "R": [list(row) for row in rotation], "T": list(translation)}
+        )
+        if not check["valid"]:
+            failures.append({"frame": sample["frame"], **check})
+    return failures
 
 
 def main():
@@ -202,49 +335,82 @@ def main():
     samples[0]["rotation"] = list(worlds[specs[0]["camera_id"]].to_quaternion())
     arrival_frames.insert(0, {"camera_id": specs[0]["camera_id"], "frame": 1})
     path_plan = None
+    smoothing_strength = None
+    smoothing_attempts = []
     if args.path_plan:
         if args.close_loop:
             raise ValueError("path-plan is open; --close-loop is not supported")
         path_plan = json.loads(Path(args.path_plan).read_text(encoding="utf-8"))
-        specs, samples, arrival_frames = planned_samples(
-            path_plan, rig, args.fps, args.seconds_per_leg
-        )
-        ids = [spec["camera_id"] for spec in specs]
+        evaluator = None
+        if request.get("planning_mode") == "target_viewspace":
+            # Recheck every proposed output frame.  Curve fitting may cut the
+            # corner of an otherwise certified polyline, so progressively reduce
+            # tangent magnitude until both geometry and target view remain valid.
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from blender_target_visibility import MeshViewValidator
 
-    allowed = request["allowed_camera_region"]
-    clearance = float(request["candidates"]["camera_clearance_m"])
-    collision_samples = []
-    for sample in samples:
-        point = sample["position"]
-        if not inside(point, allowed["minimum"], allowed["maximum"], -clearance):
-            collision_samples.append({"frame": sample["frame"], "object_id": "outside mark"})
-        for obstacle in [request["target"], *request["obstacles"]]:
-            if inside(point, obstacle["minimum"], obstacle["maximum"], clearance):
-                collision_samples.append(
-                    {"frame": sample["frame"], "object_id": obstacle["object_id"]}
+            bpy.context.scene.frame_set(args.frame)
+            evaluator = MeshViewValidator(request)
+        accepted = None
+        for strength in (1.0, 0.75, 0.5, 0.25, None):
+            trial_specs, trial_samples, trial_arrivals = planned_samples(
+                path_plan, rig, args.fps, args.seconds_per_leg, strength
+            )
+            trial_collisions = collision_failures(trial_samples, request)
+            trial_bad_views = (
+                mesh_view_failures(trial_samples, trial_specs, evaluator)
+                if evaluator is not None and not trial_collisions
+                else []
+            )
+            smoothing_attempts.append({
+                "strength": strength,
+                "collision_failures": len(trial_collisions),
+                "view_failures": len(trial_bad_views),
+            })
+            if not trial_collisions and not trial_bad_views:
+                accepted = (
+                    trial_specs,
+                    trial_samples,
+                    trial_arrivals,
+                    trial_collisions,
+                    trial_bad_views,
                 )
+                smoothing_strength = strength
+                break
+        if accepted is None:
+            report_path = output_video.parent / "trajectory_view_validation.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(json.dumps({
+                "status": "failed",
+                "smoothing_attempts": smoothing_attempts,
+                "reason": "no collision-and-view-valid smooth or linear trajectory",
+            }, indent=2), encoding="utf-8")
+            raise ValueError(f"tour curve fitting failed; see {report_path}")
+        specs, samples, arrival_frames, collision_samples, bad_frames = accepted
+        ids = [spec["camera_id"] for spec in specs]
+    else:
+        collision_samples = collision_failures(samples, request)
+        bad_frames = []
 
     if request.get("planning_mode") == "target_viewspace":
-        # Recheck every baked output frame before saving/rendering; no silent blank transitions.
-        from mathutils import Quaternion
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from blender_target_visibility import MeshViewValidator
-        bpy.context.scene.frame_set(args.frame)
-        evaluator = MeshViewValidator(request)
-        bad_frames = []
-        for sample in samples:
-            rotation = Matrix.Diagonal((1.0, -1.0, -1.0)) @ Quaternion(sample["rotation"]).to_matrix().transposed()
-            translation = -(rotation @ Vector(sample["position"]))
-            check = evaluator.check({**specs[0], "R": [list(row) for row in rotation], "T": list(translation)})
-            if not check["valid"]:
-                bad_frames.append({"frame": sample["frame"], **check})
+        if path_plan is None:
+            # Legacy cylindrical interpolation still receives an authoritative
+            # per-frame mesh check when target-view mode is requested.
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from blender_target_visibility import MeshViewValidator
+
+            bpy.context.scene.frame_set(args.frame)
+            evaluator = MeshViewValidator(request)
+            bad_frames = mesh_view_failures(samples, specs, evaluator)
         report_path = output_video.parent / "trajectory_view_validation.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps({"checked_frames": len(samples), "failures": bad_frames,
             "status": "failed" if bad_frames or collision_samples else "passed",
             "collision_failures": collision_samples,
             "collision_backend": "AABB proxy and declared allowed region",
-            "geometry_backend": "Blender evaluated scene mesh ray casts"}, indent=2), encoding="utf-8")
+            "geometry_backend": "Blender evaluated scene mesh ray casts",
+            "smoothing_strength": smoothing_strength,
+            "smoothing_attempts": smoothing_attempts}, indent=2), encoding="utf-8")
         if bad_frames or collision_samples:
             raise ValueError(f"tour frames failed geometry/composition validation; see {report_path}")
 
@@ -373,11 +539,19 @@ def main():
         "frame_count": samples[-1]["frame"],
         "duration_seconds": samples[-1]["frame"] / args.fps,
         "interpolation": (
-            ("planned polyline; quintic stops at vertices; fixed target look-at"
+            ("arc-length sampled C1 Hermite curve; continuous pass-through; fixed target look-at"
              if path_plan.get("orientation_policy") == "look_at_fixed_target_aim"
-             else "planned safe polyline; per-segment quintic timing; quaternion slerp")
+             else "arc-length sampled C1 Hermite curve; continuous pass-through")
             if path_plan
             else "azimuth-ordered cylindrical arc; quaternion slerp"
+        ),
+        "motion_profile": "single continuous arc-length schedule; no intermediate dwell",
+        "curve_smoothing_strength": smoothing_strength,
+        "curve_smoothing_attempts": smoothing_attempts,
+        "curve_safety_fallback": (
+            "piecewise-linear constant-speed path"
+            if path_plan and smoothing_strength is None
+            else None
         ),
         "path_plan": str(Path(args.path_plan).resolve()) if args.path_plan else None,
         "path_safety_model": path_plan["safety_model"] if path_plan else None,
