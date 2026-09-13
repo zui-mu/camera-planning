@@ -37,6 +37,9 @@ target_view:
   shadow_prefilter_enabled: true
   shadow_prefilter_samples: 32
   shadow_prefilter_min_visible_fraction: 0.55
+  # Frame the sofa strictly in every view. The larger surrounding region is a
+  # partial/set-level objective and therefore no longer forces distant cameras.
+  framing_region: target
   max_width_ratio: 0.70
   # Permit the tall sofa-plus-human reserve to use the available vertical frame.
   # Together with the explicit margins below, the effective usable height is 80%.
@@ -51,13 +54,23 @@ target_view:
   framing_interval_tolerance_m: 0.005
   min_visibility_fraction: 0.90
   visibility_samples: 512
-  min_composition_score: 0.72
+  # Loose candidate floor preserves alternative azimuths; only final cameras
+  # must pass the stricter quality floor.  Set selection then trades quality,
+  # union coverage and view diversity without accepting visibly poor views.
+  min_candidate_composition_score: 0.60
+  min_composition_score: 0.68
   # The capture-centre horizontal orbit is 0.995 m above this scene's floor;
   # keep it instead of rejecting it for a 5 mm numerical/asset-boundary mismatch.
   min_camera_height_m: 0.98
   max_camera_height_m: 2.40
   max_camera_distance_m: 4.50
   distance_preference_weight: 0.15
+  capture_set_coverage_weight: 0.30
+  capture_multiview_weight: 0.15
+  set_proximity_weight: 0.10
+  # Avoid spending two of eight views at the same horizontal direction merely
+  # because their elevations differ.
+  min_azimuth_separation_degrees: 5.0
   azimuth_count: 24
   azimuth_refinement_rounds: 3
   elevation_min_degrees: 0

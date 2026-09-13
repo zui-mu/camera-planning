@@ -218,6 +218,25 @@ def test_capture_box_is_default_aim_reference_and_shell_is_directional():
     assert front != pytest.approx(side)
 
 
+def test_target_framing_shell_does_not_expand_with_capture_padding():
+    request = tiny_request()
+    request.target_view.framing_region = "target"
+    request.target_view.aim_reference = "target_center"
+    request.target_view.max_camera_distance_m = 8.0
+    request.allowed_camera_region = Box(
+        object_id="large_room",
+        minimum=(-10.0, -1.0, -10.0),
+        maximum=(10.0, 10.0, 10.0),
+    )
+    direction = np.array([0.0, 0.0, 1.0])
+    before = ViewEvaluator(request, AABBGeometry([request.target])).fit_interval(direction)
+    request.target_view.capture_side_padding_m = 2.0
+    request.target_view.capture_top_padding_m = 2.0
+    after = ViewEvaluator(request, AABBGeometry([request.target])).fit_interval(direction)
+
+    assert before == pytest.approx(after)
+
+
 def test_feasible_azimuth_arcs_are_stratified_by_angular_length():
     summaries = {
         math.radians(angle): {"legal": angle in {0, 30, 60, 180}}

@@ -67,6 +67,11 @@ class MeshViewValidator:
         if np.any(np.abs(focus_local) > capture_half + 1e-9):
             raise ValueError("aim point must remain inside the capture box")
         self.corners = capture_center + (signs * capture_half) @ capture_axes.T
+        self.framing_corners = (
+            self.target_corners
+            if self.s.get("framing_region", "target") == "target"
+            else self.corners
+        )
         self.capture_surface = self._sample_box_surface(
             capture_center,
             capture_axes,
@@ -124,7 +129,7 @@ class MeshViewValidator:
         if camera_distance > self.s["max_camera_distance_m"]:
             return {"valid": False, "reason": "actual_mesh_camera_distance",
                     "height_above_floor_m": height_above_floor, "distance_m": camera_distance}
-        camera_points = self.corners @ r.T + t
+        camera_points = self.framing_corners @ r.T + t
         if (camera_points[:, 2] <= 0.01).any():
             return {"valid": False, "reason": "target_behind_camera"}
         pix = camera_points @ k.T

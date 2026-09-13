@@ -101,6 +101,9 @@ class ViewEvaluator:
             self.s.capture_visibility_samples,
             29,
         )
+        self.framing_corners = (
+            self.target_corners if self.s.framing_region == "target" else self.corners
+        )
         # A separate, much smaller deterministic set defines a lazy 3-D shadow
         # prefilter.  Rays from a queried camera position to these points are a
         # sampled proxy for the convex observation corridor to the capture box.
@@ -179,7 +182,10 @@ class ViewEvaluator:
         height = float(position[req.up_index] - req.floor_height_m)
         distance = float(np.linalg.norm(position - self.focus))
         camera = look_at(position, self.focus, self.up, req.intrinsics, "pending")
-        uv, depth = project(camera, self.corners)
+        # Strict image bounds apply to the declared framing region.  By default
+        # this is the furniture itself; the expanded capture box is allowed to
+        # be partially visible and is evaluated independently below.
+        uv, depth = project(camera, self.framing_corners)
         if (depth <= 0.01).any():
             return None, "target_behind_near_plane"
         xy = uv / [camera.width, camera.height]
@@ -203,9 +209,10 @@ class ViewEvaluator:
         visibility = float(visible.mean())
         if visibility < s.min_visibility_fraction:
             return None, "target_occluded"
-        # The expanded capture box represents the complete region which a future
-        # person/furniture image must preserve.  Exclude the target itself so this
-        # metric measures only external scene occlusion in the required view corridor.
+        # The expanded capture box is a conservative region in which a future
+        # person may appear.  It is allowed to be only partly visible in one view;
+        # set selection later rewards union and multi-view coverage.  Exclude the
+        # target itself so this measures external scene occlusion only.
         capture_pix, capture_depth = project(camera, self.capture_surface)
         capture_in_frame = (capture_depth > 0.01) & np.all(
             (capture_pix >= 0) & (capture_pix <= [camera.width, camera.height]), axis=1
@@ -229,7 +236,7 @@ class ViewEvaluator:
         composition = remaining * (
             0.5 * visibility + 0.3 * fill + 0.2 * capture_visibility
         ) + s.distance_preference_weight * proximity
-        if composition < s.min_composition_score:
+        if composition < s.min_candidate_composition_score:
             return None, "composition_score_too_low"
         return {
             "camera": camera,
@@ -237,6 +244,7 @@ class ViewEvaluator:
             "bbox": [*low.tolist(), *high.tolist()],
             "visibility": visibility,
             "capture_visibility": capture_visibility,
+            "capture_visible_mask": capture_visible,
             "fill": float(fill),
             "distance_m": distance,
             "height_above_floor_m": height,
@@ -244,7 +252,7 @@ class ViewEvaluator:
         }, None
 
     def projected_extent_ratio(self, direction, radius):
-        """Largest normalized capture-box extent at one orbit radius."""
+        """Largest normalized hard-framing extent at one orbit radius."""
         direction = unit(direction)
         probe = look_at(
             self.focus + np.asarray(direction, float),
@@ -253,7 +261,7 @@ class ViewEvaluator:
             self.request.intrinsics,
             "extent_probe",
         )
-        local = (self.corners - self.focus) @ np.asarray(probe.R).T
+        local = (self.framing_corners - self.focus) @ np.asarray(probe.R).T
         return self._projected_extent_from_local(local, radius)
 
     def _projected_extent_from_local(self, local, radius):
@@ -280,7 +288,7 @@ class ViewEvaluator:
         if abs(direction @ self.up) > 0.995:
             return None
         probe = look_at(self.focus + direction, self.focus, self.up, req.intrinsics, "probe")
-        local = (self.corners - self.focus) @ np.asarray(probe.R).T
+        local = (self.framing_corners - self.focus) @ np.asarray(probe.R).T
         k = req.intrinsics
         left = max(s.side_margin_ratio * k.width, k.cx - s.max_width_ratio * k.width / 2)
         right = min((1 - s.side_margin_ratio) * k.width, k.cx + s.max_width_ratio * k.width / 2)
@@ -682,12 +690,13 @@ def generate_views(evaluator):
     stop = ("position_budget" if len(position_cache) >= s.max_position_evaluations else
             "direction_budget" if len(direction_cache) >= s.max_direction_evaluations else
             "configured_refinement_complete")
-    return records, {"search_policy": "framing_shell_then_shadow_then_stratified_azimuth_v5",
-                     "parameterization": "direction-dependent pinhole framing shell; coarse 3-D capture-corridor exclusion; uniformly refined feasible azimuth arcs; elevation and radius inside vertical half-plane",
+    return records, {"search_policy": "target_framing_shell_then_capture_shadow_then_stratified_azimuth_v6",
+                     "parameterization": "direction-dependent pinhole target-framing shell; partial 3-D capture-corridor coverage; uniformly refined feasible azimuth arcs; elevation and radius inside vertical half-plane",
                      "framing_shell": {
+                         "region": s.framing_region,
                          "aim_reference": s.aim_reference,
                          "aim_world_m": evaluator.focus.tolist(),
-                         "near_boundary": "analytic capture-corner/frustum inequalities",
+                         "near_boundary": "analytic framing-region corner/frustum inequalities",
                          "far_boundary": "bounded 1-D solve of projected extent >= min_extent_ratio",
                          "minimum_extent_ratio": s.min_extent_ratio,
                          "distance_tolerance_m": s.framing_interval_tolerance_m,
@@ -788,8 +797,28 @@ def views_are_distinct(record_a, record_b, settings):
 
 def select_tour(evaluator, records):
     req, s = evaluator.request, evaluator.s
+    original_candidate_count = len(records)
+    source_indices = [
+        i for i, record in enumerate(records)
+        if record["composition"] >= s.min_composition_score
+    ]
+    if len(source_indices) < req.budget:
+        return None, None, {
+            "status": "blocked",
+            "reason": "insufficient_final_quality_candidates",
+            "candidate_count": len(records),
+            "final_quality_candidate_count": len(source_indices),
+            "requested_cameras": req.budget,
+            "min_candidate_composition_score": s.min_candidate_composition_score,
+            "min_final_composition_score": s.min_composition_score,
+        }
+    # Work on the final-quality subset, then map the selected local indices back
+    # to the complete candidate list returned by candidate generation.
+    records = [records[i] for i in source_indices]
     vectors = np.array([r["direction"] for r in records])
     quality = np.array([r["composition"] for r in records])
+    distances = np.array([r["distance_m"] for r in records])
+    capture_masks = np.asarray([r["capture_visible_mask"] for r in records], dtype=bool)
     azimuths = np.array([r["azimuth_rad"] for r in records])
     elevations = np.array([r["elevation_rad"] for r in records])
     refs = np.arange(s.azimuth_count) * 2 * math.pi / s.azimuth_count
@@ -805,7 +834,16 @@ def select_tour(evaluator, records):
         return view_pair_geometry(records[a], records[b])
 
     def distinct(ids, candidate):
-        return all(views_are_distinct(records[i], records[candidate], s) for i in ids)
+        for i in ids:
+            if not views_are_distinct(records[i], records[candidate], s):
+                return False
+            azimuth_gap = abs(
+                (float(azimuths[i] - azimuths[candidate]) + math.pi)
+                % (2 * math.pi) - math.pi
+            )
+            if math.degrees(azimuth_gap) < s.min_azimuth_separation_degrees:
+                return False
+        return True
 
     def score(ids):
         coverage = float(kernel[ids].max(axis=0).mean())
@@ -816,6 +854,12 @@ def select_tour(evaluator, records):
         minimum_position = min((pair[1] for pair in geometry_pairs), default=float("inf"))
         composition = float(quality[ids].mean())
         worst_composition = float(quality[ids].min())
+        capture_counts = capture_masks[ids].sum(axis=0)
+        capture_set_coverage = float(np.mean(capture_counts >= 1))
+        capture_multiview = float(np.mean(capture_counts >= 2))
+        proximity = float(np.mean(np.clip(
+            1.0 - distances[ids] / s.max_camera_distance_m, 0.0, 1.0
+        )))
         elevation_span = math.radians(s.elevation_max_degrees - s.elevation_min_degrees)
         elevation_pairs = [abs(float(elevations[a] - elevations[b])) / elevation_span
                            for a, b in itertools.combinations(ids, 2)]
@@ -823,9 +867,15 @@ def select_tour(evaluator, records):
         total = (s.direction_weight * coverage + s.baseline_weight * baseline
                  + s.composition_weight * composition
                  + s.worst_composition_weight * worst_composition
-                 + s.elevation_diversity_weight * elevation_diversity)
+                 + s.elevation_diversity_weight * elevation_diversity
+                 + s.capture_set_coverage_weight * capture_set_coverage
+                 + s.capture_multiview_weight * capture_multiview
+                 + s.set_proximity_weight * proximity)
         return total, {"direction_coverage": coverage, "anchor_baseline": baseline,
                        "composition": composition, "worst_composition": worst_composition,
+                       "capture_set_coverage": capture_set_coverage,
+                       "capture_multiview_coverage": capture_multiview,
+                       "mean_proximity": proximity,
                        "elevation_diversity": elevation_diversity,
                        "min_pairwise_view_angle_degrees": minimum_angle,
                        "min_pairwise_camera_distance_m": minimum_position,
@@ -899,7 +949,12 @@ def select_tour(evaluator, records):
                    "starts": partial, "angular_reference_count": int(reachable.sum()),
                    "angular_reference_semantics": "uniform horizontal azimuth bins near feasible candidates",
                    "selection_policy": "quality/diversity set first; exact open route second",
+                   "candidate_count": original_candidate_count,
+                   "final_quality_candidate_count": len(records),
+                   "min_candidate_composition_score": s.min_candidate_composition_score,
+                   "min_final_composition_score": s.min_composition_score,
                    "hard_min_view_direction_separation_degrees": s.min_view_direction_separation_degrees,
+                   "hard_min_azimuth_separation_degrees": s.min_azimuth_separation_degrees,
                    "hard_min_camera_position_separation_m": s.min_camera_position_separation_m,
                    "path_role": "feasibility and tie-break only"}
     if best is None:
@@ -918,7 +973,7 @@ def select_tour(evaluator, records):
                       "points": links[a, b][1], "length_m": links[a, b][0]}
                      for a, b in itertools.pairwise(order)]}
     diagnostics["metrics"] = metrics
-    return order, path, diagnostics
+    return [source_indices[i] for i in order], path, diagnostics
 
 
 def plan_target_views(request, output, seed=0):

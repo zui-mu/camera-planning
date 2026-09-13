@@ -172,9 +172,9 @@ class TargetOBB(StrictModel):
 
 class TargetViewSettings(StrictModel):
     # Only used by planning_mode=target_viewspace; no body-space sampling.
-    # The capture box is the target OBB/AABB expanded into a conservative region
-    # which the final image must frame.  Visibility of this empty envelope is
-    # tested against *other* scene objects, separately from target-surface visibility.
+    # The capture box is the target OBB/AABB expanded into a conservative region.
+    # It is sampled for partial/set-level coverage, separately from strict target
+    # framing and target-surface visibility.
     capture_side_padding_m: float = Field(default=0.0, ge=0)
     capture_top_padding_m: float = Field(default=0.0, ge=0)
     capture_bottom_padding_m: float = Field(default=0.0, ge=0)
@@ -186,9 +186,12 @@ class TargetViewSettings(StrictModel):
     shadow_prefilter_enabled: bool = True
     shadow_prefilter_samples: int = Field(default=32, ge=8, le=512)
     shadow_prefilter_min_visible_fraction: float = Field(default=0.55, ge=0, le=1)
-    # The framing shell is computed with the declared pinhole intrinsics. The
-    # capture-box centre is the default because that is the complete image
-    # region to preserve; target_center remains available for old experiments.
+    # Hard framing normally applies to the furniture itself. ``capture`` is
+    # retained for ablations which require each camera to contain the entire
+    # expanded region and consequently tend to produce distant views.
+    framing_region: Literal["target", "capture"] = "target"
+    # The aim point may remain at the capture centre even when the target alone
+    # defines the hard framing shell; this reserves image space above furniture.
     aim_reference: Literal["capture_center", "target_center"] = "capture_center"
     framing_interval_tolerance_m: float = Field(default=0.005, gt=0, le=0.10)
     max_width_ratio: float = Field(default=0.70, gt=0, lt=1)
@@ -201,7 +204,11 @@ class TargetViewSettings(StrictModel):
     aim_height_ratio: float = Field(default=0.0, ge=-0.5, le=0.5)
     min_visibility_fraction: float = Field(default=0.85, ge=0, le=1)
     visibility_samples: int = Field(default=256, ge=24, le=2048)
-    min_composition_score: float = Field(default=0.72, ge=0, le=1)
+    # Candidate generation uses a deliberately loose composition floor so that
+    # useful azimuths survive to set selection.  The stricter floor below is
+    # enforced only for cameras which may appear in the final rig.
+    min_candidate_composition_score: float = Field(default=0.60, ge=0, le=1)
+    min_composition_score: float = Field(default=0.68, ge=0, le=1)
     min_camera_height_m: float = Field(default=1.0, ge=0)
     max_camera_height_m: float = Field(default=2.4, gt=0)
     max_camera_distance_m: float = Field(default=4.20, gt=0)
@@ -233,9 +240,17 @@ class TargetViewSettings(StrictModel):
     composition_weight: float = Field(default=0.20, ge=0)
     worst_composition_weight: float = Field(default=0.35, ge=0)
     elevation_diversity_weight: float = Field(default=0.15, ge=0)
+    # Set-level terms.  The capture region is not required to be fully visible
+    # from every camera; instead the selected rig should cover it collectively
+    # and, where possible, from at least two views.  Proximity is only a soft
+    # preference and can never override hard framing/visibility constraints.
+    capture_set_coverage_weight: float = Field(default=0.30, ge=0)
+    capture_multiview_weight: float = Field(default=0.15, ge=0)
+    set_proximity_weight: float = Field(default=0.10, ge=0)
     # A pair must clear both floors.  This is a hard set constraint, not a soft
     # average which can hide one duplicate pair among many diverse pairs.
     min_view_direction_separation_degrees: float = Field(default=6.0, ge=0, lt=90)
+    min_azimuth_separation_degrees: float = Field(default=5.0, ge=0, lt=90)
     min_camera_position_separation_m: float = Field(default=0.35, ge=0)
     # Kept for old configuration files.  Path length is now only a tie-breaker
     # after a quality/diversity-valid camera set has been fixed.
@@ -261,6 +276,10 @@ class TargetViewSettings(StrictModel):
             raise ValueError("position budget must reserve three radii per initial direction")
         if self.min_extent_ratio >= max(self.max_width_ratio, self.max_height_ratio):
             raise ValueError("minimum image extent cannot exceed both maximum extents")
+        if self.min_candidate_composition_score > self.min_composition_score:
+            raise ValueError(
+                "candidate composition floor cannot exceed final-camera composition floor"
+            )
         if (
             self.shadow_prefilter_enabled
             and self.shadow_prefilter_min_visible_fraction

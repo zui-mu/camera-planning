@@ -46,7 +46,7 @@ planning_geometry: aabb_boxes
 
 ## 3. 图像构图与固定注视点
 
-`target_viewspace.ViewEvaluator` 同时建立家具角点和扩展后的 capture box。默认注视点是 capture box 中心；可选 `target_center` 仅用于复现实验。`aim_height_ratio` 允许相对所选基准做少量竖直修正，默认 0。这样光轴优先对准需要完整保留的构图区域，而不是只对准偏低的家具几何中心；它仍不读取人体头部或未来姿态。
+`target_viewspace.ViewEvaluator` 同时建立家具角点和扩展后的 capture box。默认注视点是 capture box 中心；可选 `target_center` 用于消融或特殊场景。`aim_height_ratio` 允许相对所选基准做少量竖直修正，默认 0。这样光轴为家具上方的未知人体预留画面空间，但它仍不读取人体头部或未来姿态。
 
 相机在注视点周围按 `x = aim + rho * direction` 表示；这与附件严格从家具中心 c 出发略有区别：以固定 aim 为射线起点，沿同一射线 R 不变，使构图距离可以解析求解。方向覆盖和基线评分仍相对家具中心计算。
 
@@ -54,9 +54,9 @@ planning_geometry: aabb_boxes
 
 ## 4. 每个方向自动求距离区间
 
-相机基向量固定时，capture-box 角点相机坐标可写成 `(a_x, a_y, rho + a_z)`。针孔投影为 `u = fx * a_x / (rho + a_z) + cx`、`v = fy * a_y / (rho + a_z) + cy`。`fit_interval()` 先把画面边界不等式转成方向相关的 rho 下界，取全部角点约束中的最大值；这给出“至少退多远才能把 capture box 完整装入画面”的内边界。
+相机基向量固定时，硬构图区域角点的相机坐标可写成 `(a_x, a_y, rho + a_z)`。针孔投影为 `u = fx * a_x / (rho + a_z) + cx`、`v = fy * a_y / (rho + a_z) + cy`。默认硬构图区域是目标家具本体；`framing_region: capture` 只用于要求每个镜头都完整包含扩展区域的消融实验。`fit_interval()` 把画面边界不等式转成方向相关的 rho 下界，取全部硬构图角点约束中的最大值；这给出“至少退多远才能把家具完整装入画面”的内边界。因此扩大未知人体区域不会再机械地把所有相机推远。
 
-同一方向上，越过内边界后 capture-box 的归一化投影尺寸随距离减小。程序在 allowed 区域与 `max_camera_distance_m` 给出的有限上界中，用有界一维二分求 `max(width_ratio, height_ratio) >= min_extent_ratio` 的最后一个满足位置，得到“不能远到目标过小”的外边界。停止精度由 `framing_interval_tolerance_m` 指定，默认 5 mm。于是每个三维方向得到 `[rho_near(direction), rho_far(direction)]`，所有方向共同形成不规则构图壳层，而不是固定半径球面。这里的二分只用于单调的投影尺寸，绝不用于非单调的碰撞或遮挡。
+同一方向上，越过内边界后硬构图区域的归一化投影尺寸随距离减小。程序在 allowed 区域与 `max_camera_distance_m` 给出的有限上界中，用有界一维二分求 `max(width_ratio, height_ratio) >= min_extent_ratio` 的最后一个满足位置，得到“不能远到目标过小”的外边界。停止精度由 `framing_interval_tolerance_m` 指定，默认 5 mm。于是每个三维方向得到 `[rho_near(direction), rho_far(direction)]`，所有方向共同形成不规则构图壳层，而不是固定半径球面。这里的二分只用于单调的投影尺寸，绝不用于非单调的碰撞或遮挡。
 
 用 slab 射线盒相交求相机所在方向与 allowed_camera_region 的进出距离。相机安全余量使 allowed 范围收缩。对 AABB backend，再从区间中减去每个膨胀障碍物的相交区间，因此一条射线可保留多个分离片段。
 
@@ -90,7 +90,9 @@ planning_geometry: aabb_boxes
 
 ## 6. 遮挡检查与两级几何
 
-候选阶段把目标 OBB/AABB 按配置扩展为有限 `capture box`。相机到该盒边界构成必须保持通畅的观察走廊；盒必须完整进入真实相机内参定义的视锥。程序同时计算两类射线比例：目标表面可见率保留目标自遮挡语义；capture-box 可见率排除目标自身，只测量其他场景物体对所需观察走廊的遮挡。二者都是有限几何样本，不是真实可见像素比例。AABB backend 仍是保守代理。
+候选阶段把目标 OBB/AABB 按配置扩展为有限 `capture box`。相机到该盒边界构成需要尽量通畅的观察走廊，但该盒不再要求在每个镜头里 100% 完整出现。程序同时计算两类射线比例：目标表面可见率保留目标自遮挡语义，并作为单相机硬约束；capture-box 可见率排除目标自身，只测量其他场景物体对未知人体预留区的遮挡，并采用较宽松的单相机下限。最终相机集合另外最大化 capture 样本的并集覆盖率与至少双视角覆盖率，使不同镜头互补。二者都是有限几何样本，不是真实可见像素比例。AABB backend 仍是保守代理。
+
+候选构图分使用两级门槛。`min_candidate_composition_score` 是宽松的搜索门槛，用于排除明显无用位置而保留更多水平角；`min_composition_score` 是最终机位必须满足的较严格门槛。只有通过最终门槛的候选才参与 8 机位集合选择。集合效用同时考虑水平角覆盖、基线、平均与最差构图、俯仰互补、capture 并集/双视角覆盖，以及很小的近距离偏好。`min_azimuth_separation_degrees` 另外禁止两个最终机位占用几乎相同的水平角，即使二者俯仰不同；三维观察夹角和空间距离仍各有独立硬下限。距离偏好是软项，不能让被遮挡或构图越界的相机通过。
 
 渲染阶段的 `blender_target_visibility.MeshViewValidator` 同时复核目标真实网格可见率和 capture-box 外部遮挡。后者沿射线跳过目标网格，只把其他场景对象记作遮挡。该检查不需要为候选渲染 RGB 图，只有最终机位才生成高清图片；结果仍受有限射线分辨率和透明材质近似限制。
 
