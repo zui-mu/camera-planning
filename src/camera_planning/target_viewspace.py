@@ -101,6 +101,17 @@ class ViewEvaluator:
             self.s.capture_visibility_samples,
             29,
         )
+        # A separate, much smaller deterministic set defines a lazy 3-D shadow
+        # prefilter.  Rays from a queried camera position to these points are a
+        # sampled proxy for the convex observation corridor to the capture box.
+        # The full target/capture visibility checks below remain authoritative.
+        self.shadow_surface = sample_box_surface(
+            capture_center,
+            capture_axes,
+            capture_half,
+            self.s.shadow_prefilter_samples,
+            43,
+        )
         self.center = self.target_corners.mean(axis=0)
         self.up = np.eye(3)[request.up_index]
         self.scale = max(float(np.linalg.norm(np.ptp(self.corners, axis=0))), 1e-3)
@@ -111,22 +122,58 @@ class ViewEvaluator:
         )
         self.rejections = Counter()
 
-    def evaluate(self, position):
+    def basic_position_reason(self, position):
+        """Reject a camera centre without doing any target visibility work."""
         position = np.asarray(position, float)
         req, s = self.request, self.s
         clearance = req.candidates.camera_clearance_m
         height = float(position[req.up_index] - req.floor_height_m)
         if height < s.min_camera_height_m or height > s.max_camera_height_m:
-            return None, "camera_height_out_of_range"
+            return "camera_height_out_of_range"
         distance = float(np.linalg.norm(position - self.focus))
         if distance > s.max_camera_distance_m:
-            return None, "camera_too_far"
+            return "camera_too_far"
         if not inside_box(position, req.allowed_camera_region, -clearance):
-            return None, "outside_camera_region"
+            return "outside_camera_region"
         if self.geometry.occupied(position[None], clearance)[0]:
-            return None, "camera_collision"
+            return "camera_collision"
         if abs(np.dot(unit(self.focus - position), self.up)) > 0.995:
-            return None, "vertical_look_at_singularity"
+            return "vertical_look_at_singularity"
+        return None
+
+    def shadow_prefilter(self, position):
+        """Cheaply exclude a clearly occluded point in the bounded 3-D search domain.
+
+        This is intentionally a point test, not an azimuth veto.  A low table can
+        therefore reject low/radially-behind positions while a higher camera in
+        the same vertical half-plane survives.  The target itself is excluded:
+        only other scene geometry may cast this coarse shadow.
+        """
+        reason = self.basic_position_reason(position)
+        if reason is not None:
+            return None, reason
+        if not self.s.shadow_prefilter_enabled:
+            return 1.0, None
+        position = np.asarray(position, float)
+        endpoints = self.shadow_surface + (position - self.shadow_surface) * 1e-6
+        blocked = self.geometry.blocked(
+            position,
+            endpoints,
+            exclude_object_id=self.request.target.object_id,
+        )
+        visible_fraction = float((~blocked).mean())
+        if visible_fraction < self.s.shadow_prefilter_min_visible_fraction:
+            return visible_fraction, "coarse_capture_shadow"
+        return visible_fraction, None
+
+    def evaluate(self, position):
+        position = np.asarray(position, float)
+        req, s = self.request, self.s
+        reason = self.basic_position_reason(position)
+        if reason is not None:
+            return None, reason
+        height = float(position[req.up_index] - req.floor_height_m)
+        distance = float(np.linalg.norm(position - self.focus))
         camera = look_at(position, self.focus, self.up, req.intrinsics, "pending")
         uv, depth = project(camera, self.corners)
         if (depth <= 0.01).any():
@@ -283,7 +330,8 @@ def generate_views(evaluator):
     """Uniform azimuths outside, elevation/radius search inside each vertical half-plane."""
     s, req = evaluator.s, evaluator.request
     records, direction_cache, position_cache, trace = [], {}, {}, []
-    radial_queries = local_queries = 0
+    radial_queries = local_queries = exact_position_queries = 0
+    shadow_queries, shadow_rejections = 0, 0
     horizontal_axes = [i for i in range(3) if i != req.up_index]
     azimuth_centers = np.arange(s.azimuth_count) * 2 * math.pi / s.azimuth_count
     initial_elevations = np.linspace(math.radians(s.elevation_min_degrees),
@@ -302,13 +350,23 @@ def generate_views(evaluator):
         record["elevation_rad"] = math.atan2(delta[req.up_index], np.linalg.norm(horizontal))
 
     def evaluate_position(position, local=False):
-        nonlocal radial_queries, local_queries
+        nonlocal radial_queries, local_queries, exact_position_queries
+        nonlocal shadow_queries, shadow_rejections
         key = tuple(np.round(position, 10))
         if key in position_cache:
             return position_cache[key], True
         if len(position_cache) >= s.max_position_evaluations:
             return None, False
-        value, reason = evaluator.evaluate(position)
+        coarse_visibility, reason = evaluator.shadow_prefilter(position)
+        if s.shadow_prefilter_enabled and coarse_visibility is not None:
+            shadow_queries += 1
+        if reason is None:
+            value, reason = evaluator.evaluate(position)
+            exact_position_queries += 1
+        else:
+            value = None
+            if reason == "coarse_capture_shadow":
+                shadow_rejections += 1
         position_cache[key] = value
         if local:
             local_queries += 1
@@ -479,8 +537,18 @@ def generate_views(evaluator):
     stop = ("position_budget" if len(position_cache) >= s.max_position_evaluations else
             "direction_budget" if len(direction_cache) >= s.max_direction_evaluations else
             "configured_refinement_complete")
-    return records, {"search_policy": "azimuth_first_vertical_plane_v3",
-                     "parameterization": "uniform/refined azimuth; elevation and radius inside vertical half-plane",
+    return records, {"search_policy": "lazy_3d_shadow_prefilter_then_uniform_azimuth_v4",
+                     "parameterization": "coarse 3-D capture-corridor exclusion; uniform/refined azimuth; elevation and radius inside vertical half-plane",
+                     "shadow_prefilter": {
+                         "enabled": s.shadow_prefilter_enabled,
+                         "semantics": "sampled camera-to-capture-box corridor; excludes positions, never whole azimuths",
+                         "samples_per_position": s.shadow_prefilter_samples,
+                         "minimum_visible_fraction": s.shadow_prefilter_min_visible_fraction,
+                         "queries": shadow_queries,
+                         "rejected_positions": shadow_rejections,
+                         "exact_visibility_queries_avoided": shadow_rejections,
+                         "exact_position_queries": exact_position_queries,
+                     },
                      "coarse_azimuth_count": s.azimuth_count,
                      "coarse_azimuth_sweep_complete": coarse_complete,
                      "direction_queries": len(direction_cache), "radial_queries": radial_queries,

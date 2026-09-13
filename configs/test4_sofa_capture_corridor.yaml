@@ -30,6 +30,11 @@ target_view:
   capture_bottom_padding_m: 0.00
   capture_visibility_samples: 256
   min_capture_visibility_fraction: 0.90
+  # First remove only clearly occluded 3-D positions with a cheap sampled
+  # observation-corridor test. Low obstacles do not delete an entire azimuth.
+  shadow_prefilter_enabled: true
+  shadow_prefilter_samples: 32
+  shadow_prefilter_min_visible_fraction: 0.55
   max_width_ratio: 0.70
   max_height_ratio: 0.65
   top_margin_ratio: 0.12

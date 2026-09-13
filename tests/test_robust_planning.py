@@ -19,7 +19,7 @@ from camera_planning.planner import load_request, plan
 from camera_planning.refinement import check_evidence_budget, concatenate_evidence
 from camera_planning.scoring import build_evidence, evaluate_set
 from camera_planning.selection import select
-from camera_planning.target_viewspace import capture_box_for, views_are_distinct
+from camera_planning.target_viewspace import ViewEvaluator, capture_box_for, views_are_distinct
 from camera_planning.trajectory import connect, open_order
 
 
@@ -141,6 +141,39 @@ def test_capture_box_expansion_and_external_aabb_visibility():
     assert not target_only.blocked(
         origin, [endpoint], exclude_object_id=request.target.object_id
     )[0]
+
+
+def test_shadow_prefilter_removes_positions_not_whole_vertical_plane():
+    request = tiny_request()
+    request.target_view.capture_side_padding_m = 0.0
+    request.target_view.capture_top_padding_m = 0.0
+    request.target_view.capture_bottom_padding_m = 0.0
+    request.target_view.shadow_prefilter_samples = 128
+    request.target_view.shadow_prefilter_min_visible_fraction = 0.55
+    request.target_view.min_camera_height_m = 0.1
+    request.target_view.max_camera_height_m = 3.0
+    table = Box(
+        object_id="low_table",
+        minimum=(-2.0, 0.0, 0.7),
+        maximum=(2.0, 0.9, 2.2),
+    )
+    evaluator = ViewEvaluator(request, AABBGeometry([request.target, table]))
+
+    low_visibility, low_reason = evaluator.shadow_prefilter([0.0, 0.6, 3.0])
+    high_visibility, high_reason = evaluator.shadow_prefilter([0.0, 2.7, 3.0])
+
+    assert low_reason == "coarse_capture_shadow"
+    assert low_visibility < request.target_view.shadow_prefilter_min_visible_fraction
+    assert high_reason is None
+    assert high_visibility > low_visibility
+
+
+def test_shadow_prefilter_must_be_looser_than_final_visibility():
+    with pytest.raises(ValueError, match="shadow prefilter must be looser"):
+        TargetViewSettings(
+            shadow_prefilter_min_visible_fraction=0.95,
+            min_capture_visibility_fraction=0.90,
+        )
 
 
 def test_view_pair_requires_angle_and_position_floors():

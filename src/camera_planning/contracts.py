@@ -180,6 +180,12 @@ class TargetViewSettings(StrictModel):
     capture_bottom_padding_m: float = Field(default=0.0, ge=0)
     capture_visibility_samples: int = Field(default=128, ge=24, le=4096)
     min_capture_visibility_fraction: float = Field(default=0.90, ge=0, le=1)
+    # Cheap first-stage test of the finite camera-to-capture-box corridor.  It
+    # removes only 3-D positions whose corridor is already clearly occluded;
+    # it never removes a whole azimuth merely because an obstacle is on the floor.
+    shadow_prefilter_enabled: bool = True
+    shadow_prefilter_samples: int = Field(default=32, ge=8, le=512)
+    shadow_prefilter_min_visible_fraction: float = Field(default=0.55, ge=0, le=1)
     max_width_ratio: float = Field(default=0.70, gt=0, lt=1)
     max_height_ratio: float = Field(default=0.65, gt=0, lt=1)
     top_margin_ratio: float = Field(default=0.20, ge=0, lt=0.5)
@@ -250,6 +256,14 @@ class TargetViewSettings(StrictModel):
             raise ValueError("position budget must reserve three radii per initial direction")
         if self.min_extent_ratio >= max(self.max_width_ratio, self.max_height_ratio):
             raise ValueError("minimum image extent cannot exceed both maximum extents")
+        if (
+            self.shadow_prefilter_enabled
+            and self.shadow_prefilter_min_visible_fraction
+            > self.min_capture_visibility_fraction
+        ):
+            raise ValueError(
+                "shadow prefilter must be looser than the authoritative capture visibility test"
+            )
         return self
 
 
