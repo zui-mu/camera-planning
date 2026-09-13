@@ -186,14 +186,19 @@ class TargetViewSettings(StrictModel):
     shadow_prefilter_enabled: bool = True
     shadow_prefilter_samples: int = Field(default=32, ge=8, le=512)
     shadow_prefilter_min_visible_fraction: float = Field(default=0.55, ge=0, le=1)
+    # The framing shell is computed with the declared pinhole intrinsics. The
+    # capture-box centre is the default because that is the complete image
+    # region to preserve; target_center remains available for old experiments.
+    aim_reference: Literal["capture_center", "target_center"] = "capture_center"
+    framing_interval_tolerance_m: float = Field(default=0.005, gt=0, le=0.10)
     max_width_ratio: float = Field(default=0.70, gt=0, lt=1)
     max_height_ratio: float = Field(default=0.65, gt=0, lt=1)
     top_margin_ratio: float = Field(default=0.20, ge=0, lt=0.5)
     side_margin_ratio: float = Field(default=0.10, ge=0, lt=0.5)
     bottom_margin_ratio: float = Field(default=0.10, ge=0, lt=0.5)
     min_extent_ratio: float = Field(default=0.18, gt=0, lt=1)
-    # Furniture-relative, world-up aim offset; image-space constraints still decide feasibility.
-    aim_height_ratio: float = Field(default=0.12, ge=0, le=0.5)
+    # World-up offset from the chosen target/capture reference, scaled by furniture height.
+    aim_height_ratio: float = Field(default=0.0, ge=-0.5, le=0.5)
     min_visibility_fraction: float = Field(default=0.85, ge=0, le=1)
     visibility_samples: int = Field(default=256, ge=24, le=2048)
     min_composition_score: float = Field(default=0.72, ge=0, le=1)

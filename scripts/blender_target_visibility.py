@@ -47,8 +47,6 @@ class MeshViewValidator:
         self.target_corners = target_center + (signs * target_half) @ target_axes.T
         self.center = self.target_corners.mean(axis=0)
         height = float(np.ptp(self.target_corners[:, self.up_index]))
-        self.focus = self.center.copy()
-        self.focus[self.up_index] += height * self.s["aim_height_ratio"]
 
         capture_axes, capture_half = target_axes.copy(), target_half.copy()
         local_up = int(np.argmax(np.abs(capture_axes.T @ up)))
@@ -60,6 +58,14 @@ class MeshViewValidator:
         bottom = self.s.get("capture_bottom_padding_m", 0.0)
         capture_center = target_center + up * (top - bottom) / 2
         capture_half[local_up] += (top + bottom) / 2
+        aim_reference = self.s.get("aim_reference", "target_center")
+        self.focus = (
+            capture_center.copy() if aim_reference == "capture_center" else self.center.copy()
+        )
+        self.focus[self.up_index] += height * self.s.get("aim_height_ratio", 0.0)
+        focus_local = (self.focus - capture_center) @ capture_axes
+        if np.any(np.abs(focus_local) > capture_half + 1e-9):
+            raise ValueError("aim point must remain inside the capture box")
         self.corners = capture_center + (signs * capture_half) @ capture_axes.T
         self.capture_surface = self._sample_box_surface(
             capture_center,

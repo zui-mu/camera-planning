@@ -116,7 +116,11 @@ class ViewEvaluator:
         self.up = np.eye(3)[request.up_index]
         self.scale = max(float(np.linalg.norm(np.ptp(self.corners, axis=0))), 1e-3)
         height = float(np.ptp(self.target_corners[:, request.up_index]))
-        self.focus = self.center + self.up * height * self.s.aim_height_ratio
+        base_focus = capture_center if self.s.aim_reference == "capture_center" else self.center
+        self.focus = base_focus + self.up * height * self.s.aim_height_ratio
+        focus_local = (self.focus - capture_center) @ capture_axes
+        if np.any(np.abs(focus_local) > capture_half + 1e-9):
+            raise ValueError("aim point must remain inside the capture box")
         self.surface, self.normals = geometry.sample_surface(
             request.target.object_id, self.s.visibility_samples, 17, request.up_index, -1.0
         )
@@ -234,13 +238,40 @@ class ViewEvaluator:
             "composition": float(composition),
         }, None
 
+    def projected_extent_ratio(self, direction, radius):
+        """Largest normalized capture-box extent at one orbit radius."""
+        direction = unit(direction)
+        probe = look_at(
+            self.focus + np.asarray(direction, float),
+            self.focus,
+            self.up,
+            self.request.intrinsics,
+            "extent_probe",
+        )
+        local = (self.corners - self.focus) @ np.asarray(probe.R).T
+        return self._projected_extent_from_local(local, radius)
+
+    def _projected_extent_from_local(self, local, radius):
+        """Project fixed camera-basis coordinates without rebuilding the pose."""
+        depth = local[:, 2] + float(radius)
+        if (depth <= 0.01).any():
+            return math.inf
+        k = self.request.intrinsics
+        u = k.fx * local[:, 0] / depth + k.cx
+        v = k.fy * local[:, 1] / depth + k.cy
+        return float(max(np.ptp(u) / k.width, np.ptp(v) / k.height))
+
     def fit_interval(self, direction):
-        """Sufficient framing interval from linear pinhole inequalities.
+        """Direction-dependent near/far radii of the pinhole framing shell.
 
         Orbit origin is the fixed aim point; orientation stays constant along a ray.
-        Do NOT binary-search collision/visibility, which are non-monotone.
+        The near boundary follows directly from linear corner/frustum inequalities.
+        Beyond it projected box extent decreases, so a bounded 1-D bisection finds
+        the far boundary imposed by ``min_extent_ratio``. Collision and visibility
+        stay outside this calculation because they are non-monotone.
         """
         req, s = self.request, self.s
+        direction = unit(direction)
         if abs(direction @ self.up) > 0.995:
             return None
         probe = look_at(self.focus + direction, self.focus, self.up, req.intrinsics, "probe")
@@ -266,11 +297,28 @@ class ViewEvaluator:
         if interval is None:
             return None
         lo = max(rho * (1 + 1e-6), interval[0], 0.01)
-        hi = min(interval[1], s.max_camera_distance_m)
-        return (lo, hi) if hi > lo else None
+        hi_limit = min(interval[1], s.max_camera_distance_m)
+        if hi_limit <= lo:
+            return None
+        def extent_at(radius):
+            return self._projected_extent_from_local(local, radius)
 
-    def radial_intervals(self, direction):
-        interval = self.fit_interval(direction)
+        if extent_at(lo) < s.min_extent_ratio:
+            return None
+        if extent_at(hi_limit) >= s.min_extent_ratio:
+            return lo, hi_limit
+
+        feasible, too_far = lo, hi_limit
+        while too_far - feasible > s.framing_interval_tolerance_m:
+            middle = (feasible + too_far) / 2
+            if extent_at(middle) >= s.min_extent_ratio:
+                feasible = middle
+            else:
+                too_far = middle
+        return (lo, feasible) if feasible > lo else None
+
+    def radial_intervals(self, direction, interval=None):
+        interval = self.fit_interval(direction) if interval is None else interval
         if interval is None:
             return []
         intervals = [interval]
@@ -298,6 +346,87 @@ class ViewEvaluator:
 
 def circular_distance(a, b):
     return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
+
+
+def feasible_azimuth_intervals(plane_summaries):
+    """Approximate connected feasible arcs using sampled-plane Voronoi cells."""
+    if not plane_summaries:
+        return []
+    ordered = sorted(
+        (float(angle) % (2 * math.pi), bool(value["legal"]))
+        for angle, value in plane_summaries.items()
+    )
+    angles = np.asarray([item[0] for item in ordered])
+    legal = np.asarray([item[1] for item in ordered], dtype=bool)
+    if not legal.any():
+        return []
+    if legal.all():
+        return [
+            {
+                "start_rad": 0.0,
+                "end_rad": 2 * math.pi,
+                "width_rad": 2 * math.pi,
+                "legal_samples": len(ordered),
+            }
+        ]
+
+    anchor = int(np.flatnonzero(~legal)[0])
+    indices = [(anchor + step) % len(ordered) for step in range(len(ordered) + 1)]
+    unwrapped = []
+    previous = None
+    for index in indices:
+        angle = float(angles[index])
+        if previous is not None:
+            while angle <= previous:
+                angle += 2 * math.pi
+        unwrapped.append((angle, bool(legal[index])))
+        previous = angle
+
+    result, start, count = [], None, 0
+    for (left_angle, left_legal), (right_angle, right_legal) in itertools.pairwise(unwrapped):
+        boundary = (left_angle + right_angle) / 2
+        if not left_legal and right_legal:
+            start, count = boundary, 0
+        if right_legal:
+            count += 1
+        if left_legal and not right_legal and start is not None:
+            width = boundary - start
+            normalized_start = start % (2 * math.pi)
+            result.append(
+                {
+                    "start_rad": normalized_start,
+                    "end_rad": normalized_start + width,
+                    "width_rad": width,
+                    "legal_samples": count,
+                }
+            )
+            start, count = None, 0
+    return result
+
+
+def stratified_azimuth_centers(intervals, count):
+    """Allocate angular strata by feasible-arc length, with one per arc first."""
+    if count <= 0 or not intervals:
+        return np.empty(0)
+    intervals = sorted(intervals, key=lambda item: item["width_rad"], reverse=True)[:count]
+    widths = np.asarray([item["width_rad"] for item in intervals], dtype=float)
+    quotas = np.ones(len(intervals), dtype=int)
+    remaining = count - len(intervals)
+    if remaining:
+        raw = remaining * widths / widths.sum()
+        extra = np.floor(raw).astype(int)
+        quotas += extra
+        left = remaining - int(extra.sum())
+        order = np.argsort(-(raw - extra), kind="stable")
+        quotas[order[:left]] += 1
+    centers = []
+    for interval, quota in zip(intervals, quotas, strict=True):
+        start, width = interval["start_rad"], interval["width_rad"]
+        centers.extend(
+            (start + (index + 0.5) * width / quota) % (2 * math.pi)
+            for index in range(quota)
+        )
+    return np.asarray(sorted(centers))
 
 
 def azimuth_bin_indices(records, centers, count, per_bin):
@@ -399,7 +528,12 @@ def generate_views(evaluator):
                     legal.append(value)
             return radial_cache[radius], True
 
-        intervals = evaluator.radial_intervals(direction)
+        shell_interval = evaluator.fit_interval(direction)
+        intervals = (
+            evaluator.radial_intervals(direction, shell_interval)
+            if shell_interval is not None
+            else []
+        )
         queue = deque((lo, hi, 0) for lo, hi in intervals)
         truncated = False
         while queue:
@@ -436,6 +570,8 @@ def generate_views(evaluator):
         direction_cache[key] = summary
         trace.append({"stage": stage, "azimuth_degrees": math.degrees(azimuth),
                       "elevation_degrees": math.degrees(elevation),
+                      "framing_shell_interval_m": shell_interval,
+                      "collision_free_intervals_m": intervals,
                       "framing_free_intervals_m": intervals, "tested_radii": len(radial_cache),
                       "radial_budget_truncated": truncated, "retained": len(kept), **summary})
         return summary
@@ -526,7 +662,11 @@ def generate_views(evaluator):
             unique[key] = record
     records = list(unique.values())
     before_cap = len(records)
-    chosen, bins = azimuth_bin_indices(records, azimuth_centers, s.max_candidates,
+    feasible_intervals = feasible_azimuth_intervals(plane_summaries)
+    retention_centers = stratified_azimuth_centers(feasible_intervals, s.azimuth_count)
+    if not len(retention_centers):
+        retention_centers = azimuth_centers
+    chosen, bins = azimuth_bin_indices(records, retention_centers, s.max_candidates,
                                        s.max_candidates_per_azimuth_bin)
     before_counts = Counter(int(v) for v in bins)
     after_counts = Counter(int(bins[i]) for i in chosen)
@@ -537,8 +677,16 @@ def generate_views(evaluator):
     stop = ("position_budget" if len(position_cache) >= s.max_position_evaluations else
             "direction_budget" if len(direction_cache) >= s.max_direction_evaluations else
             "configured_refinement_complete")
-    return records, {"search_policy": "lazy_3d_shadow_prefilter_then_uniform_azimuth_v4",
-                     "parameterization": "coarse 3-D capture-corridor exclusion; uniform/refined azimuth; elevation and radius inside vertical half-plane",
+    return records, {"search_policy": "framing_shell_then_shadow_then_stratified_azimuth_v5",
+                     "parameterization": "direction-dependent pinhole framing shell; coarse 3-D capture-corridor exclusion; uniformly refined feasible azimuth arcs; elevation and radius inside vertical half-plane",
+                     "framing_shell": {
+                         "aim_reference": s.aim_reference,
+                         "aim_world_m": evaluator.focus.tolist(),
+                         "near_boundary": "analytic capture-corner/frustum inequalities",
+                         "far_boundary": "bounded 1-D solve of projected extent >= min_extent_ratio",
+                         "minimum_extent_ratio": s.min_extent_ratio,
+                         "distance_tolerance_m": s.framing_interval_tolerance_m,
+                     },
                      "shadow_prefilter": {
                          "enabled": s.shadow_prefilter_enabled,
                          "semantics": "sampled camera-to-capture-box corridor; excludes positions, never whole azimuths",
@@ -558,9 +706,19 @@ def generate_views(evaluator):
                      "stop_reason": stop, "before_candidate_cap": before_cap,
                      "retained_candidates": len(records), "requested_candidate_cap": s.max_candidates,
                      "max_candidates_per_azimuth_bin": s.max_candidates_per_azimuth_bin,
+                     "feasible_azimuth_intervals": [
+                         {"start_degrees": math.degrees(item["start_rad"]),
+                          "end_degrees_unwrapped": math.degrees(item["end_rad"]),
+                          "width_degrees": math.degrees(item["width_rad"]),
+                          "legal_samples": item["legal_samples"]}
+                         for item in feasible_intervals
+                     ],
+                     "azimuth_strata_centers_degrees": [
+                         math.degrees(angle) for angle in retention_centers
+                     ],
                      "azimuth_bins": [{"bin": i, "center_degrees": math.degrees(angle),
                                         "before": before_counts[i], "retained": after_counts[i]}
-                                       for i, angle in enumerate(azimuth_centers)],
+                                       for i, angle in enumerate(retention_centers)],
                      "vertical_planes": [{"azimuth_degrees": math.degrees(angle), **summary}
                                          for angle, summary in sorted(plane_summaries.items())],
                      "direction_trace": trace, "rejections": dict(evaluator.rejections),

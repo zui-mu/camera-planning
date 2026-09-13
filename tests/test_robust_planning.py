@@ -1,5 +1,6 @@
 import itertools
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,13 @@ from camera_planning.planner import load_request, plan
 from camera_planning.refinement import check_evidence_budget, concatenate_evidence
 from camera_planning.scoring import build_evidence, evaluate_set
 from camera_planning.selection import select
-from camera_planning.target_viewspace import ViewEvaluator, capture_box_for, views_are_distinct
+from camera_planning.target_viewspace import (
+    ViewEvaluator,
+    capture_box_for,
+    feasible_azimuth_intervals,
+    stratified_azimuth_centers,
+    views_are_distinct,
+)
 from camera_planning.trajectory import connect, open_order
 
 
@@ -174,6 +181,60 @@ def test_shadow_prefilter_must_be_looser_than_final_visibility():
             shadow_prefilter_min_visible_fraction=0.95,
             min_capture_visibility_fraction=0.90,
         )
+
+
+def test_framing_shell_has_a_projected_size_far_boundary():
+    request = tiny_request()
+    request.target_view.min_extent_ratio = 0.40
+    request.target_view.max_camera_distance_m = 8.0
+    request.target_view.framing_interval_tolerance_m = 0.001
+    evaluator = ViewEvaluator(request, AABBGeometry([request.target]))
+    direction = np.array([0.0, 0.0, 1.0])
+
+    near, far = evaluator.fit_interval(direction)
+
+    assert near < far < request.target_view.max_camera_distance_m
+    assert evaluator.projected_extent_ratio(direction, far) >= 0.40
+    assert evaluator.projected_extent_ratio(direction, far + 0.01) < 0.40
+
+
+def test_capture_box_is_default_aim_reference_and_shell_is_directional():
+    request = tiny_request()
+    request.target_view.capture_top_padding_m = 1.0
+    request.target_view.min_extent_ratio = 0.30
+    request.target_view.max_camera_distance_m = 8.0
+    request.allowed_camera_region = Box(
+        object_id="large_room",
+        minimum=(-10.0, -1.0, -10.0),
+        maximum=(10.0, 10.0, 10.0),
+    )
+    evaluator = ViewEvaluator(request, AABBGeometry([request.target]))
+    capture_center, _, _ = capture_box_for(request)
+    front = evaluator.fit_interval([0.0, 0.0, 1.0])
+    side = evaluator.fit_interval([1.0, 0.0, 0.0])
+
+    assert np.allclose(evaluator.focus, capture_center)
+    assert front is not None and side is not None
+    assert front != pytest.approx(side)
+
+
+def test_feasible_azimuth_arcs_are_stratified_by_angular_length():
+    summaries = {
+        math.radians(angle): {"legal": angle in {0, 30, 60, 180}}
+        for angle in range(0, 360, 30)
+    }
+    intervals = feasible_azimuth_intervals(summaries)
+    centers = stratified_azimuth_centers(intervals, 8)
+
+    assert len(intervals) == 2
+    assert len(centers) == 8
+    wide = max(intervals, key=lambda item: item["width_rad"])
+    in_wide = [
+        angle
+        for angle in centers
+        if (angle - wide["start_rad"]) % (2 * math.pi) <= wide["width_rad"] + 1e-9
+    ]
+    assert len(in_wide) > len(centers) / 2
 
 
 def test_view_pair_requires_angle_and_position_floors():

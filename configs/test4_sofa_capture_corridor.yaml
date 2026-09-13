@@ -41,7 +41,10 @@ target_view:
   side_margin_ratio: 0.08
   bottom_margin_ratio: 0.08
   min_extent_ratio: 0.18
-  aim_height_ratio: 0.12
+  # Aim at the centre of the complete capture region, not the low furniture centre.
+  aim_reference: capture_center
+  aim_height_ratio: 0.00
+  framing_interval_tolerance_m: 0.005
   min_visibility_fraction: 0.90
   visibility_samples: 512
   min_composition_score: 0.72
