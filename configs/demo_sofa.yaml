@@ -1,0 +1,50 @@
+# Synthetic proxy scene, NOT measured geometry of YSynthetic test_sofa.
+schema_version: camera_planning_request_v2
+scene_id: camera_demo_sofa
+length_unit: meter
+up_axis: Y
+floor_height_m: 0.0
+budget: 4
+target:
+  object_id: sofa_proxy
+  minimum: [-1.0, 0.05, -0.5]
+  maximum: [1.0, 0.85, 0.5]
+obstacles:
+  - object_id: back_wall
+    minimum: [-4.5, -0.1, -3.2]
+    maximum: [4.5, 3.2, -3.0]
+  - object_id: side_cabinet
+    minimum: [2.0, 0.0, -1.2]
+    maximum: [2.7, 1.8, -0.4]
+allowed_camera_region:
+  object_id: admissible_interior
+  minimum: [-4.3, 0.1, -2.85]
+  maximum: [4.3, 2.9, 4.2]
+intrinsics:
+  width: 1024
+  height: 1024
+  fx: 900
+  fy: 900
+  cx: 512
+  cy: 512
+candidates:
+  azimuth_count: 24
+  shell_offsets_m: [2.0, 3.0]
+  heights_above_floor_m: [1.2, 1.8]
+  focus_heights_above_floor_m: [1.0]
+  camera_clearance_m: 0.12
+  min_target_distance_m: 1.5
+  max_target_distance_m: 6.0
+  min_surface_visible_fraction: 0.10
+  min_envelope_visible_fraction: 0.20
+observation:
+  mode: furniture_surface_and_envelope
+  surface_samples: 360
+  envelope_samples: 360
+  horizontal_clearance_m: 0.8
+  min_height_above_floor_m: 0.05
+  full_body_height_m: 2.1
+  top_clearance_m: 0.25
+  image_margin_ratio: 0.08
+  underside_normal_threshold: -0.15
+  seed: 17

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ys-camera-planning"
+version = "0.4.0"
+description = "Pose-agnostic furniture-centric camera set planning for YSynthetic"
+requires-python = ">=3.11"
+dependencies = [
+  "imageio-ffmpeg>=0.6,<1",
+  "numpy>=1.26,<3",
+  "pydantic>=2.7,<3",
+  "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.8,<1"]
+mesh = ["trimesh>=4,<5", "rtree>=1,<2"]
+solver = ["scipy>=1.11,<2"]
+
+[project.scripts]
+camera-plan = "camera_planning.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100

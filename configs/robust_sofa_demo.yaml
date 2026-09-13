@@ -1,0 +1,62 @@
+# Synthetic AABB pilot; not the real room, and not an HMR-quality experiment.
+schema_version: camera_planning_request_v2
+scene_id: robust_sofa_demo
+length_unit: meter
+up_axis: Y
+floor_height_m: 0
+budget: 8
+target:
+  object_id: sofa
+  minimum: [-1, 0.05, -0.5]
+  maximum: [1, 0.85, 0.5]
+obstacles:
+  - object_id: cabinet
+    minimum: [2.0, 0, -1.2]
+    maximum: [2.7, 1.8, -0.4]
+  - object_id: back_wall
+    minimum: [-4.5, -0.1, -3.2]
+    maximum: [4.5, 3.2, -3.0]
+allowed_camera_region:
+  object_id: camera_room_bounds
+  minimum: [-4.3, 0.10, -2.85]
+  maximum: [4.3, 2.9, 4.2]
+intrinsics:
+  width: 1280
+  height: 720
+  fx: 800
+  fy: 800
+  cx: 640
+  cy: 360
+observation:
+  mode: furniture_free_space
+  region:
+    object_id: observation_room_bounds
+    minimum: [-4.3, 0.01, -2.85]
+    maximum: [4.3, 2.9, 4.2]
+  voxel_size_m: 0.25
+  neighborhood_radius_m: 0.9
+  spatial_samples: 512
+  surface_samples: 96
+  image_margin_ratio: 0.05
+candidates:
+  azimuth_count: 16
+  heights_above_floor_m: [1.0, 1.7, 2.3]
+  shell_offsets_m: [1.8, 2.7]
+  min_target_distance_m: 1.2
+  max_target_distance_m: 6
+  min_surface_visible_fraction: 0.05
+  min_space_visible_fraction: 0.02
+scoring:
+  objective: robust_space
+  tail_fraction: 0.2
+  tail_weight: 0.5
+  multistarts: 3
+  swap_passes: 2
+adaptive:
+  enabled: true
+  rounds: 2
+  max_candidates: 160
+  proposals_per_round: 32
+path:
+  enabled: true
+  voxel_size_m: 0.35

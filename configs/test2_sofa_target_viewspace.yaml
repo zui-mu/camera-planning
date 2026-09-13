@@ -1,0 +1,84 @@
+# Run target-viewspace sofa test into a clean test2 output directory.
+schema_version: camera_pilot_config_v2
+scene_id: test2_sofa_target_viewspace
+planning_mode: target_viewspace
+source_scene: D:/camera/testinput/room/export_scene.usdc
+target_scene: D:/camera/testinput/sofa/SofaFactory_1935615__spawn_asset_3130031_.usdc
+blender_executable: E:/jianmoruanjian/blenderdownload/blender.exe
+output: D:/camera/testoutput/test2
+planning_geometry: aabb_boxes
+box_structure_policy: auto_geometry
+exclude_objects: [Cube]
+allowed_min_m: [0.20, 0.20, 0.30]
+allowed_max_m: [6.15, 5.15, 2.70]
+floor_height_m: 0.139958
+budget: 8
+intrinsics:
+  width: 2560
+  height: 1440
+  fx: 1600
+  fy: 1600
+  cx: 1280
+  cy: 720
+candidates:
+  camera_clearance_m: 0.15
+target_view:
+  max_width_ratio: 0.70
+  max_height_ratio: 0.65
+  top_margin_ratio: 0.20
+  side_margin_ratio: 0.10
+  bottom_margin_ratio: 0.10
+  min_extent_ratio: 0.18
+  aim_height_ratio: 0.12
+  # A view enters the candidate pool only after satisfying all four limits.
+  min_visibility_fraction: 0.90
+  visibility_samples: 512
+  min_composition_score: 0.78
+  min_camera_height_m: 1.00
+  max_camera_height_m: 2.40
+  max_camera_distance_m: 4.20
+  distance_preference_weight: 0.15
+  # Uniform horizontal angles; elevation and radius are searched in each vertical plane.
+  azimuth_count: 24
+  azimuth_refinement_rounds: 1
+  elevation_min_degrees: 0
+  elevation_max_degrees: 40
+  elevation_count: 5
+  elevation_refinement_rounds: 2
+  max_direction_evaluations: 600
+  # Candidate generation budget (path validation has its own separate budget).
+  max_position_evaluations: 4096
+  max_radial_evaluations_per_direction: 17
+  # A horizontal sector cannot fill the pool with nearly duplicate views.
+  max_candidates_per_azimuth_bin: 6
+  max_visibility_change: 0.15
+  max_bbox_change: 0.10
+  radial_min_depth: 2
+  radial_max_depth: 5
+  min_radial_step_target_ratio: 0.025
+  max_candidates: 128
+  local_refine_seeds: 8
+  local_refine_rounds: 2
+  coverage_angle_degrees: 35
+  direction_weight: 1.0
+  baseline_weight: 0.25
+  composition_weight: 0.20
+  worst_composition_weight: 0.35
+  elevation_diversity_weight: 0.15
+  path_weight: 0.10
+  insertion_shortlist: 12
+  selection_starts: 3
+  max_path_queries: 300
+  transition_check_step_m: 0.15
+path:
+  enabled: true
+  voxel_size_m: 0.25
+method: greedy
+seed: 0
+frame: 1
+tour:
+  enabled: true
+  close_loop: false
+  fps: 24
+  seconds_per_leg: 1.5
+  resolution_percentage: 75
