@@ -1,0 +1,98 @@
+# Fresh run for the staged capture-corridor planner.  It writes only to test5.
+schema_version: camera_pilot_config_v2
+scene_id: test5_sofa_capture_corridor
+planning_mode: target_viewspace
+source_scene: D:/camera/testinput/room/export_scene.usdc
+target_scene: D:/camera/testinput/sofa/SofaFactory_1935615__spawn_asset_3130031_.usdc
+blender_executable: E:/jianmoruanjian/blenderdownload/blender.exe
+output: D:/camera/testoutput/test5
+planning_geometry: aabb_boxes
+box_structure_policy: auto_geometry
+exclude_objects: [Cube]
+allowed_min_m: [0.20, 0.20, 0.30]
+allowed_max_m: [6.15, 5.15, 2.70]
+floor_height_m: 0.139958
+budget: 8
+intrinsics:
+  width: 2560
+  height: 1440
+  fx: 1600
+  fy: 1600
+  cx: 1280
+  cy: 720
+candidates:
+  camera_clearance_m: 0.15
+target_view:
+  capture_side_padding_m: 0.30
+  capture_top_padding_m: 1.10
+  capture_bottom_padding_m: 0.00
+  capture_visibility_samples: 256
+  min_capture_visibility_fraction: 0.60
+  shadow_prefilter_enabled: true
+  shadow_prefilter_samples: 32
+  shadow_prefilter_min_visible_fraction: 0.55
+  framing_region: target
+  max_width_ratio: 0.70
+  max_height_ratio: 0.80
+  top_margin_ratio: 0.12
+  side_margin_ratio: 0.08
+  bottom_margin_ratio: 0.08
+  min_extent_ratio: 0.18
+  aim_reference: capture_center
+  aim_height_ratio: 0.00
+  framing_interval_tolerance_m: 0.005
+  min_visibility_fraction: 0.90
+  visibility_samples: 512
+  min_candidate_composition_score: 0.60
+  min_composition_score: 0.66
+  min_camera_height_m: 0.98
+  max_camera_height_m: 2.40
+  max_camera_distance_m: 4.50
+  distance_preference_weight: 0.15
+  capture_set_coverage_weight: 0.30
+  capture_multiview_weight: 0.15
+  set_proximity_weight: 0.10
+  min_azimuth_separation_degrees: 5.0
+  azimuth_count: 24
+  azimuth_refinement_rounds: 3
+  elevation_min_degrees: 0
+  elevation_max_degrees: 40
+  elevation_count: 5
+  elevation_refinement_rounds: 2
+  max_direction_evaluations: 900
+  max_position_evaluations: 6144
+  max_radial_evaluations_per_direction: 17
+  max_candidates_per_azimuth_bin: 6
+  max_visibility_change: 0.15
+  max_bbox_change: 0.10
+  radial_min_depth: 2
+  radial_max_depth: 5
+  min_radial_step_target_ratio: 0.025
+  max_candidates: 128
+  local_refine_seeds: 8
+  local_refine_rounds: 2
+  coverage_angle_degrees: 35
+  direction_weight: 1.0
+  baseline_weight: 0.25
+  composition_weight: 0.20
+  worst_composition_weight: 0.35
+  elevation_diversity_weight: 0.15
+  min_view_direction_separation_degrees: 6.0
+  min_camera_position_separation_m: 0.35
+  path_weight: 0.10
+  insertion_shortlist: 12
+  selection_starts: 5
+  max_path_queries: 300
+  transition_check_step_m: 0.15
+path:
+  enabled: true
+  voxel_size_m: 0.25
+method: greedy
+seed: 0
+frame: 1
+tour:
+  enabled: true
+  close_loop: false
+  fps: 24
+  seconds_per_leg: 1.5
+  resolution_percentage: 75
