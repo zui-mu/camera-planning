@@ -73,7 +73,12 @@ def inside_box(points, box: Box, margin=0.0):
 class GeometryBackend(Protocol):
     name: str
 
-    def blocked(self, origin: np.ndarray, endpoints: np.ndarray) -> np.ndarray: ...
+    def blocked(
+        self,
+        origin: np.ndarray,
+        endpoints: np.ndarray,
+        exclude_object_id: str | None = None,
+    ) -> np.ndarray: ...
     def occupied(self, points: np.ndarray, clearance: float = 0.0) -> np.ndarray: ...
     def object_vertices(self, object_id: str) -> np.ndarray: ...
     def sample_surface(
@@ -164,18 +169,25 @@ class AABBGeometry:
             )
         return result
 
-    def blocked(self, origin, endpoints):
+    def blocked(self, origin, endpoints, exclude_object_id=None):
+        if exclude_object_id is None:
+            lows, highs = self._lows, self._highs
+        else:
+            keep = np.asarray([box.object_id != exclude_object_id for box in self.boxes])
+            lows, highs = self._lows[keep], self._highs[keep]
+            if not len(lows):
+                return np.zeros(len(endpoints), dtype=bool)
         directions = np.asarray(endpoints) - origin
         result = np.zeros(len(endpoints), dtype=bool)
         for start in range(0, len(endpoints), 1024):
             batch = directions[start : start + 1024, None, :]
             parallel = abs(batch) < 1e-12
             possible = np.all(
-                ~parallel | ((origin >= self._lows) & (origin <= self._highs)), axis=2
+                ~parallel | ((origin >= lows) & (origin <= highs)), axis=2
             )
             denominator = np.where(parallel, 1.0, batch)
-            a = (self._lows - origin) / denominator
-            b = (self._highs - origin) / denominator
+            a = (lows - origin) / denominator
+            b = (highs - origin) / denominator
             near = np.max(np.where(parallel, -np.inf, np.minimum(a, b)), axis=2)
             far = np.min(np.where(parallel, np.inf, np.maximum(a, b)), axis=2)
             result[start : start + len(batch)] = np.any(

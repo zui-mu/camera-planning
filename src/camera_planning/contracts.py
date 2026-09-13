@@ -172,6 +172,14 @@ class TargetOBB(StrictModel):
 
 class TargetViewSettings(StrictModel):
     # Only used by planning_mode=target_viewspace; no body-space sampling.
+    # The capture box is the target OBB/AABB expanded into a conservative region
+    # which the final image must frame.  Visibility of this empty envelope is
+    # tested against *other* scene objects, separately from target-surface visibility.
+    capture_side_padding_m: float = Field(default=0.0, ge=0)
+    capture_top_padding_m: float = Field(default=0.0, ge=0)
+    capture_bottom_padding_m: float = Field(default=0.0, ge=0)
+    capture_visibility_samples: int = Field(default=128, ge=24, le=4096)
+    min_capture_visibility_fraction: float = Field(default=0.90, ge=0, le=1)
     max_width_ratio: float = Field(default=0.70, gt=0, lt=1)
     max_height_ratio: float = Field(default=0.65, gt=0, lt=1)
     top_margin_ratio: float = Field(default=0.20, ge=0, lt=0.5)
@@ -214,6 +222,12 @@ class TargetViewSettings(StrictModel):
     composition_weight: float = Field(default=0.20, ge=0)
     worst_composition_weight: float = Field(default=0.35, ge=0)
     elevation_diversity_weight: float = Field(default=0.15, ge=0)
+    # A pair must clear both floors.  This is a hard set constraint, not a soft
+    # average which can hide one duplicate pair among many diverse pairs.
+    min_view_direction_separation_degrees: float = Field(default=6.0, ge=0, lt=90)
+    min_camera_position_separation_m: float = Field(default=0.35, ge=0)
+    # Kept for old configuration files.  Path length is now only a tie-breaker
+    # after a quality/diversity-valid camera set has been fixed.
     path_weight: float = Field(default=0.10, ge=0)
     insertion_shortlist: int = Field(default=12, ge=2, le=64)
     selection_starts: int = Field(default=3, ge=1, le=8)

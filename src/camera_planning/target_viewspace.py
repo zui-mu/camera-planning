@@ -7,23 +7,72 @@ surface proxy supplied by the geometry backend, not rendered segmentation area.
 import itertools
 import math
 from collections import Counter, deque
-from pathlib import Path
 
 import numpy as np
 
 from .artifacts import json_hash, new_output, write_json
 from .free_space import FreeGrid
 from .geometry import inside_box, load_geometry, look_at, project, unit
-from .trajectory import connect
+from .trajectory import connect, open_order
+
+
+def box_frame_for(request):
+    """Return target center, orthonormal axes and half extents."""
+    if request.target_obb is not None:
+        box = request.target_obb
+        return (
+            np.asarray(box.center, dtype=float),
+            np.asarray(box.axes, dtype=float),
+            np.asarray(box.half_extents, dtype=float),
+        )
+    lo, hi = np.asarray(request.target.minimum), np.asarray(request.target.maximum)
+    return (lo + hi) / 2, np.eye(3), (hi - lo) / 2
+
+
+def capture_box_for(request):
+    """Expand the target box into the finite region that every view must preserve."""
+    center, axes, half = box_frame_for(request)
+    center, axes, half = center.copy(), axes.copy(), half.copy()
+    up = np.eye(3)[request.up_index]
+    local_up = int(np.argmax(np.abs(axes.T @ up)))
+    if float(axes[:, local_up] @ up) < 0:
+        axes[:, local_up] *= -1
+    horizontal = [i for i in range(3) if i != local_up]
+    half[horizontal] += request.target_view.capture_side_padding_m
+    top = request.target_view.capture_top_padding_m
+    bottom = request.target_view.capture_bottom_padding_m
+    center += up * (top - bottom) / 2
+    half[local_up] += (top + bottom) / 2
+    return center, axes, half
+
+
+def frame_corners(center, axes, half):
+    signs = np.asarray(list(itertools.product((-1, 1), repeat=3)), dtype=float)
+    return np.asarray(center) + (signs * np.asarray(half)) @ np.asarray(axes).T
+
+
+def sample_box_surface(center, axes, half, count, seed):
+    """Deterministic area-weighted samples on a capture box boundary."""
+    center, axes, half = np.asarray(center), np.asarray(axes), np.asarray(half)
+    faces = []
+    for axis in range(3):
+        others = [i for i in range(3) if i != axis]
+        area = 4 * half[others[0]] * half[others[1]]
+        for sign in (-1.0, 1.0):
+            faces.append((axis, sign, others, area))
+    weights = np.asarray([face[3] for face in faces], dtype=float)
+    weights /= weights.sum()
+    rng = np.random.default_rng(seed)
+    selected = rng.choice(len(faces), count, p=weights)
+    local = rng.uniform(-half, half, size=(count, 3))
+    for i, face_index in enumerate(selected):
+        axis, sign, _, _ = faces[face_index]
+        local[i, axis] = sign * half[axis]
+    return center + local @ axes.T
 
 
 def corners_for(request):
-    if request.target_obb is not None:
-        box = request.target_obb
-        signs = np.array(list(itertools.product((-1, 1), repeat=3)))
-        return np.asarray(box.center) + (signs * box.half_extents) @ np.asarray(box.axes).T
-    lo, hi = request.target.minimum, request.target.maximum
-    return np.array(list(itertools.product(*zip(lo, hi))), float)
+    return frame_corners(*box_frame_for(request))
 
 
 def ray_interval(origin, direction, lo, hi):
@@ -42,11 +91,20 @@ def ray_interval(origin, direction, lo, hi):
 class ViewEvaluator:
     def __init__(self, request, geometry):
         self.request, self.geometry, self.s = request, geometry, request.target_view
-        self.corners = corners_for(request)
-        self.center = self.corners.mean(axis=0)
+        self.target_corners = corners_for(request)
+        capture_center, capture_axes, capture_half = capture_box_for(request)
+        self.corners = frame_corners(capture_center, capture_axes, capture_half)
+        self.capture_surface = sample_box_surface(
+            capture_center,
+            capture_axes,
+            capture_half,
+            self.s.capture_visibility_samples,
+            29,
+        )
+        self.center = self.target_corners.mean(axis=0)
         self.up = np.eye(3)[request.up_index]
         self.scale = max(float(np.linalg.norm(np.ptp(self.corners, axis=0))), 1e-3)
-        height = float(np.ptp(self.corners[:, request.up_index]))
+        height = float(np.ptp(self.target_corners[:, request.up_index]))
         self.focus = self.center + self.up * height * self.s.aim_height_ratio
         self.surface, self.normals = geometry.sample_surface(
             request.target.object_id, self.s.visibility_samples, 17, request.up_index, -1.0
@@ -94,10 +152,27 @@ class ViewEvaluator:
         visibility = float(visible.mean())
         if visibility < s.min_visibility_fraction:
             return None, "target_occluded"
+        # The expanded capture box represents the complete region which a future
+        # person/furniture image must preserve.  Exclude the target itself so this
+        # metric measures only external scene occlusion in the required view corridor.
+        capture_pix, capture_depth = project(camera, self.capture_surface)
+        capture_in_frame = (capture_depth > 0.01) & np.all(
+            (capture_pix >= 0) & (capture_pix <= [camera.width, camera.height]), axis=1
+        )
+        capture_endpoints = self.capture_surface + (position - self.capture_surface) * 1e-6
+        capture_visible = capture_in_frame & ~self.geometry.blocked(
+            position,
+            capture_endpoints,
+            exclude_object_id=req.target.object_id,
+        )
+        capture_visibility = float(capture_visible.mean())
+        if capture_visibility < s.min_capture_visibility_fraction:
+            return None, "capture_corridor_occluded"
         fill = min(1.0, max(wh[0] / s.max_width_ratio, wh[1] / s.max_height_ratio))
         proximity = max(0.0, 1.0 - distance / s.max_camera_distance_m)
         remaining = 1.0 - s.distance_preference_weight
-        composition = remaining * (0.6 * visibility + 0.4 * fill) + s.distance_preference_weight * proximity
+        effective_visibility = min(visibility, capture_visibility)
+        composition = remaining * (0.6 * effective_visibility + 0.4 * fill) + s.distance_preference_weight * proximity
         if composition < s.min_composition_score:
             return None, "composition_score_too_low"
         return {
@@ -105,6 +180,7 @@ class ViewEvaluator:
             "direction": unit(position - self.center),
             "bbox": [*low.tolist(), *high.tolist()],
             "visibility": visibility,
+            "capture_visibility": capture_visibility,
             "fill": float(fill),
             "distance_m": distance,
             "height_above_floor_m": height,
@@ -297,6 +373,7 @@ def generate_views(evaluator):
         summary = {"legal": best is not None,
                    "composition": best["composition"] if best else 0.0,
                    "visibility": best["visibility"] if best else 0.0,
+                   "capture_visibility": best["capture_visibility"] if best else 0.0,
                    "distance_m": best["distance_m"] if best else None}
         direction_cache[key] = summary
         trace.append({"stage": stage, "azimuth_degrees": math.degrees(azimuth),
@@ -460,6 +537,24 @@ class TargetPathGrid(FreeGrid):
         return True
 
 
+def view_pair_geometry(record_a, record_b):
+    """Return geodesic viewing-angle and camera-center separation for two records."""
+    cosine = float(np.clip(record_a["direction"] @ record_b["direction"], -1, 1))
+    angle = math.degrees(math.acos(cosine))
+    distance = float(
+        np.linalg.norm(record_a["camera"].center - record_b["camera"].center)
+    )
+    return angle, distance
+
+
+def views_are_distinct(record_a, record_b, settings):
+    angle, distance = view_pair_geometry(record_a, record_b)
+    return (
+        angle >= settings.min_view_direction_separation_degrees
+        and distance >= settings.min_camera_position_separation_m
+    )
+
+
 def select_tour(evaluator, records):
     req, s = evaluator.request, evaluator.s
     vectors = np.array([r["direction"] for r in records])
@@ -475,10 +570,19 @@ def select_tour(evaluator, records):
     if kernel.shape[1] == 0:
         raise ValueError("no angular quadrature nodes covered")
 
-    def score(ids, length):
+    def pair_geometry(a, b):
+        return view_pair_geometry(records[a], records[b])
+
+    def distinct(ids, candidate):
+        return all(views_are_distinct(records[i], records[candidate], s) for i in ids)
+
+    def score(ids):
         coverage = float(kernel[ids].max(axis=0).mean())
         pairs = [max(0.0, 1 - float(vectors[a] @ vectors[b])**2) for a, b in itertools.combinations(ids, 2)]
         baseline = float(np.mean(pairs)) if pairs else 0.0
+        geometry_pairs = [pair_geometry(a, b) for a, b in itertools.combinations(ids, 2)]
+        minimum_angle = min((pair[0] for pair in geometry_pairs), default=180.0)
+        minimum_position = min((pair[1] for pair in geometry_pairs), default=float("inf"))
         composition = float(quality[ids].mean())
         worst_composition = float(quality[ids].min())
         elevation_span = math.radians(s.elevation_max_degrees - s.elevation_min_degrees)
@@ -488,12 +592,13 @@ def select_tour(evaluator, records):
         total = (s.direction_weight * coverage + s.baseline_weight * baseline
                  + s.composition_weight * composition
                  + s.worst_composition_weight * worst_composition
-                 + s.elevation_diversity_weight * elevation_diversity
-                 - s.path_weight * length / evaluator.scale)
+                 + s.elevation_diversity_weight * elevation_diversity)
         return total, {"direction_coverage": coverage, "anchor_baseline": baseline,
                        "composition": composition, "worst_composition": worst_composition,
                        "elevation_diversity": elevation_diversity,
-                       "path_length_m": length, "total": total}
+                       "min_pairwise_view_angle_degrees": minimum_angle,
+                       "min_pairwise_camera_distance_m": minimum_position,
+                       "total": total}
 
     grid, links = TargetPathGrid(evaluator), {}
     queries = 0
@@ -511,51 +616,68 @@ def select_tour(evaluator, records):
             links[b, a] = (value[0], value[1][::-1]) if value else None
         return links[a, b]
 
-    best, partial = None, []
+    best, partial, complete_sets = None, [], []
     starts, _ = azimuth_bin_indices(records, refs, min(s.selection_starts, len(records)), 1)
     for start in starts:
-        order, length = [start], 0.0
-        while len(order) < req.budget:
-            available = [i for i in range(len(records)) if i not in order]
-            # Cheap optimistic score (zero extra travel); true costs used before acceptance.
-            available.sort(key=lambda i: score(order + [i], length)[0], reverse=True)
-            winner = None
-            for candidate in available[:s.insertion_shortlist]:
-                for slot in range(len(order) + 1):
-                    before = order[slot - 1] if slot else None
-                    after = order[slot] if slot < len(order) else None
-                    left = link(before, candidate) if before is not None else (0.0, [])
-                    right = link(candidate, after) if after is not None else (0.0, [])
-                    if left is None or right is None:
-                        continue
-                    removed = links[before, after][0] if before is not None and after is not None else 0
-                    new_length = length + left[0] + right[0] - removed
-                    if req.path.max_length_m is not None and new_length > req.path.max_length_m:
-                        continue
-                    trial = order[:slot] + [candidate] + order[slot:]
-                    utility, metrics = score(trial, new_length)
-                    if winner is None or utility > winner[0]:
-                        winner = utility, trial, new_length, metrics
-            if winner is None:
+        selected = [start]
+        while len(selected) < req.budget:
+            available = [
+                i for i in range(len(records))
+                if i not in selected and distinct(selected, i)
+            ]
+            if not available:
                 break
-            _, order, length, _ = winner
-        partial.append({"start": start, "selected_count": len(order), "length_m": length})
-        if len(order) == req.budget:
-            utility, metrics = score(order, length)
-            if best is None or utility > best[0]:
-                best = utility, order, metrics
+            selected.append(max(available, key=lambda i: score(selected + [i])[0]))
+        entry = {"start": start, "selected_count": len(selected)}
+        if len(selected) == req.budget:
+            utility, metrics = score(selected)
+            entry["selection_total"] = utility
+            complete_sets.append((utility, selected, metrics, entry))
+        partial.append(entry)
+
+    # Selection is complete before path planning.  Build an exact shortest open
+    # visit order over each bounded greedy set; route length breaks only true
+    # selection-score ties and can no longer buy a duplicate camera.
+    for utility, selected, metrics, entry in complete_sets:
+        costs = np.full((len(selected), len(selected)), np.inf)
+        np.fill_diagonal(costs, 0.0)
+        for a, b in itertools.combinations(range(len(selected)), 2):
+            edge = link(selected[a], selected[b])
+            if edge is not None:
+                costs[a, b] = costs[b, a] = edge[0]
+        local_order = open_order(costs)
+        if local_order is None:
+            entry["path_status"] = "blocked"
+            continue
+        length = float(sum(costs[a, b] for a, b in itertools.pairwise(local_order)))
+        if req.path.max_length_m is not None and length > req.path.max_length_m:
+            entry["path_status"] = "too_long"
+            entry["length_m"] = length
+            continue
+        order = [selected[i] for i in local_order]
+        entry["path_status"] = "planned"
+        entry["length_m"] = length
+        metrics = {**metrics, "path_length_m": length}
+        if best is None or utility > best[0] + 1e-12 or (
+            abs(utility - best[0]) <= 1e-12 and length < best[3]
+        ):
+            best = utility, order, metrics, length
     diagnostics = {"path_queries": queries, "path_query_cap": s.max_path_queries,
                    "transition_view_checks": len(grid.view_cache),
                    "transition_view_check_cap": s.max_transition_view_checks,
                    "starts": partial, "angular_reference_count": int(reachable.sum()),
-                   "angular_reference_semantics": "uniform horizontal azimuth bins near feasible candidates"}
+                   "angular_reference_semantics": "uniform horizontal azimuth bins near feasible candidates",
+                   "selection_policy": "quality/diversity set first; exact open route second",
+                   "hard_min_view_direction_separation_degrees": s.min_view_direction_separation_degrees,
+                   "hard_min_camera_position_separation_m": s.min_camera_position_separation_m,
+                   "path_role": "feasibility and tie-break only"}
     if best is None:
         return None, None, diagnostics
-    _, order, metrics = best
+    _, order, metrics, _ = best
     path = {"format_version": "camera_open_path_v1", "status": "planned", "closed": False,
             "length_unit": "meter", "length_m": metrics["path_length_m"],
             "geometry_backend": evaluator.geometry.name,
-            "selection_coupling": "bounded multi-start greedy insertion using obstacle-aware edge costs",
+            "selection_coupling": "bounded multi-start greedy camera set, then exact open ordering",
             "safety_model": "geometry clearance; target composition/visibility sampled along edges",
             "transition_check_step_m": s.transition_check_step_m,
             "focus_world_m": evaluator.focus.tolist(), "world_up": evaluator.up.tolist(),
@@ -578,10 +700,16 @@ def plan_target_views(request, output, seed=0):
     write_json(root / "viewspace_search.json", search)
     write_json(root / "candidate_cameras.json", rig(request.scene_id, [r["camera"] for r in records]))
     write_json(root / "target_view_evidence.json", {
-        "target_corners_world_m": evaluator.corners.tolist(), "focus_world_m": evaluator.focus.tolist(),
-        "visibility_semantics": "front-facing target surface samples; not rendered pixels or human visibility",
+        "target_corners_world_m": evaluator.target_corners.tolist(),
+        "capture_corners_world_m": evaluator.corners.tolist(),
+        "focus_world_m": evaluator.focus.tolist(),
+        "visibility_semantics": (
+            "target visibility uses front-facing target-surface samples; capture visibility uses "
+            "the finite expanded target-box corridor and excludes target self-occlusion"
+        ),
         "candidates": [{"camera_id": r["camera"].camera_id, "bbox_normalized": r["bbox"],
                         "visibility_fraction": r["visibility"], "composition": r["composition"],
+                        "capture_visibility_fraction": r["capture_visibility"],
                         "fill": r["fill"], "distance_m": r["distance_m"],
                         "height_above_floor_m": r["height_above_floor_m"],
                         "azimuth_degrees": math.degrees(r["azimuth_rad"]),
@@ -609,9 +737,15 @@ def plan_target_views(request, output, seed=0):
         {"camera_id": c.camera_id, "position_world_m": c.center.tolist(),
          "view_direction_world": np.asarray(c.R)[2].tolist()} for c in cameras]})
     # Keep preview compatible while removing hypothetical human/free-space point clouds entirely.
-    np.savez_compressed(root / "evidence.npz", points=evaluator.corners, kinds=np.full(8, 3, np.int8))
+    np.savez_compressed(
+        root / "evidence.npz",
+        points=evaluator.corners,
+        kinds=np.full(len(evaluator.corners), 3, np.int8),
+    )
     write_json(root / "observation_domain.json", {"mode": "target_viewspace", "human_scale_used": False,
-               "human_position_samples": 0, "bbox_source": request.target_obb.method if request.target_obb else "aabb_fallback"})
+                "human_position_samples": 0,
+                "capture_region": "expanded_target_box_view_corridor",
+                "bbox_source": request.target_obb.method if request.target_obb else "aabb_fallback"})
     write_json(root / "post_generation_contract.json", {
         "scene_id": request.scene_id, "expected_subject": "one human static in world coordinates",
         "camera_source": "tour/camera_trajectory.json (actual per-frame K/R/T)",
@@ -624,11 +758,11 @@ def plan_target_views(request, output, seed=0):
               "feasible_count": len(records), "selected_ids": [c.camera_id for c in cameras],
               "metrics": selection["metrics"], "trajectory_status": "planned",
               "geometry_backend": evaluator.geometry.name, "reconstruction_status": "not_run",
-              "limitations": ["bounded heuristic; no global optimum or exhaustive feasible-domain guarantee",
-                              "visibility and transitions are finite samples; not exact pixel coverage",
-                              "AABB backend can overestimate occlusion and closes concave free regions",
-                              "OBB geometry axes do not identify semantic furniture front",
-                              "image margins do not guarantee a complete future person or visible floor",
+               "limitations": ["bounded heuristic; no global optimum or exhaustive feasible-domain guarantee",
+                            "visibility and transitions are finite samples; not exact pixel coverage",
+                            "AABB backend can overestimate occlusion and closes concave free regions",
+                            "OBB geometry axes do not identify semantic furniture front",
+                            "capture-box padding is geometric and does not predict a future pose",
                               "azimuth/elevation/radius search is bounded and may miss a narrow feasible region",
                               "generated video must be checked before inheriting calibrated cameras"]}
     write_json(root / "camera_plan_result.json", result)

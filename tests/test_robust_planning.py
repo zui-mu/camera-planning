@@ -5,7 +5,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from camera_planning.contracts import Box, Intrinsics, ObservationSettings, ScoreSettings
+from camera_planning.contracts import (
+    Box,
+    Intrinsics,
+    ObservationSettings,
+    ScoreSettings,
+    TargetViewSettings,
+)
 from camera_planning.free_space import FreeGrid, furniture_domain
 from camera_planning.geometry import AABBGeometry, look_at
 from camera_planning.observability import lower_tail, point_quality, spatial_metrics
@@ -13,6 +19,7 @@ from camera_planning.planner import load_request, plan
 from camera_planning.refinement import check_evidence_budget, concatenate_evidence
 from camera_planning.scoring import build_evidence, evaluate_set
 from camera_planning.selection import select
+from camera_planning.target_viewspace import capture_box_for, views_are_distinct
 from camera_planning.trajectory import connect, open_order
 
 
@@ -110,6 +117,48 @@ def test_thin_wall_blocks_grid_edge_and_path():
     grid = FreeGrid(region, 0.5, AABBGeometry([wall]), 1000)
     assert grid.free.all()  # wall falls BETWEEN centers
     assert connect(grid, [-0.75, 0.25, 0.25], [0.75, 0.25, 0.25], 1000) is None
+
+
+def test_capture_box_expansion_and_external_aabb_visibility():
+    request = tiny_request()
+    request.target_view.capture_side_padding_m = 0.5
+    request.target_view.capture_top_padding_m = 2.0
+    request.target_view.capture_bottom_padding_m = 0.25
+    center, axes, half = capture_box_for(request)
+    corners = center + np.array(list(itertools.product((-1, 1), repeat=3))) * half @ axes.T
+    target_low, target_high = np.asarray(request.target.minimum), np.asarray(request.target.maximum)
+    assert corners[:, request.up_index].min() == pytest.approx(
+        target_low[request.up_index] - 0.25
+    )
+    assert corners[:, request.up_index].max() == pytest.approx(
+        target_high[request.up_index] + 2.0
+    )
+
+    target_only = AABBGeometry([request.target])
+    origin = np.asarray(request.target.minimum) - 1
+    endpoint = np.asarray(request.target.maximum) + 1
+    assert target_only.blocked(origin, [endpoint])[0]
+    assert not target_only.blocked(
+        origin, [endpoint], exclude_object_id=request.target.object_id
+    )[0]
+
+
+def test_view_pair_requires_angle_and_position_floors():
+    settings = TargetViewSettings(
+        min_view_direction_separation_degrees=6,
+        min_camera_position_separation_m=0.35,
+    )
+
+    def record(position):
+        position = np.asarray(position, float)
+        return {
+            "camera": look_at(position, [0, 0, 0], [0, 0, 1], Intrinsics(), "test"),
+            "direction": position / np.linalg.norm(position),
+        }
+
+    assert not views_are_distinct(record([3, 0, 1]), record([3.05, 0, 1]), settings)
+    assert not views_are_distinct(record([3, 0, 1]), record([4, 0, 4 / 3]), settings)
+    assert views_are_distinct(record([3, 0, 1]), record([3, 0.8, 1.2]), settings)
 
 
 def test_path_detours_and_open_order():

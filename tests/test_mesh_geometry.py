@@ -50,6 +50,11 @@ def test_triangle_mesh_segment_and_solid_queries():
         leaf_size=2,
     )
     assert geometry.blocked(np.array([-2.0, 0, 0]), np.array([[2.0, 0, 0]])).tolist() == [True]
+    assert geometry.blocked(
+        np.array([-2.0, 0, 0]),
+        np.array([[2.0, 0, 0]]),
+        exclude_object_id="cube",
+    ).tolist() == [False]
     assert geometry.blocked(np.array([-2.0, 2, 0]), np.array([[2.0, 2, 0]])).tolist() == [False]
     assert geometry.blocked(np.array([-2.0, 0, 0]), np.array([[-1.0, 0, 0]])).tolist() == [False]
     assert geometry.occupied(np.array([[0, 0, 0], [2, 0, 0]])).tolist() == [True, False]
