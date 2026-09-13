@@ -222,8 +222,13 @@ class ViewEvaluator:
         fill = min(1.0, max(wh[0] / s.max_width_ratio, wh[1] / s.max_height_ratio))
         proximity = max(0.0, 1.0 - distance / s.max_camera_distance_m)
         remaining = 1.0 - s.distance_preference_weight
-        effective_visibility = min(visibility, capture_visibility)
-        composition = remaining * (0.6 * effective_visibility + 0.4 * fill) + s.distance_preference_weight * proximity
+        # Furniture visibility is a strict per-camera requirement.  The expanded
+        # capture region is only a weak per-camera preference because different
+        # cameras are expected to cover complementary parts of that region.
+        # Do not let capture visibility cap otherwise excellent target views.
+        composition = remaining * (
+            0.5 * visibility + 0.3 * fill + 0.2 * capture_visibility
+        ) + s.distance_preference_weight * proximity
         if composition < s.min_composition_score:
             return None, "composition_score_too_low"
         return {

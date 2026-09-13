@@ -168,9 +168,12 @@ class MeshViewValidator:
         fill = float(min(1.0, max(wh[0] / s["max_width_ratio"], wh[1] / s["max_height_ratio"])))
         proximity = max(0.0, 1.0 - camera_distance / s["max_camera_distance_m"])
         remaining = 1.0 - s["distance_preference_weight"]
-        effective_fraction = min(fraction, capture_fraction)
-        composition = float(remaining * (0.6 * effective_fraction + 0.4 * fill)
-                            + s["distance_preference_weight"] * proximity)
+        # Match the planner semantics: target visibility is strict, while the
+        # expanded capture region is a weaker preference that camera sets may
+        # satisfy collectively through complementary viewpoints.
+        composition = float(remaining * (
+            0.5 * fraction + 0.3 * fill + 0.2 * capture_fraction
+        ) + s["distance_preference_weight"] * proximity)
         valid = bool(hits > 0 and fraction >= s["min_visibility_fraction"]
                      and capture_fraction >= s.get("min_capture_visibility_fraction", 0.90)
                      and composition >= s["min_composition_score"])

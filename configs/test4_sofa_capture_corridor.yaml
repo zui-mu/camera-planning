@@ -29,14 +29,18 @@ target_view:
   capture_top_padding_m: 1.10
   capture_bottom_padding_m: 0.00
   capture_visibility_samples: 256
-  min_capture_visibility_fraction: 0.90
+  # The expanded region is a set-level coverage objective: an individual view
+  # may cover only part of it, while the sofa itself remains strict below.
+  min_capture_visibility_fraction: 0.60
   # First remove only clearly occluded 3-D positions with a cheap sampled
   # observation-corridor test. Low obstacles do not delete an entire azimuth.
   shadow_prefilter_enabled: true
   shadow_prefilter_samples: 32
   shadow_prefilter_min_visible_fraction: 0.55
   max_width_ratio: 0.70
-  max_height_ratio: 0.65
+  # Permit the tall sofa-plus-human reserve to use the available vertical frame.
+  # Together with the explicit margins below, the effective usable height is 80%.
+  max_height_ratio: 0.80
   top_margin_ratio: 0.12
   side_margin_ratio: 0.08
   bottom_margin_ratio: 0.08
@@ -48,9 +52,11 @@ target_view:
   min_visibility_fraction: 0.90
   visibility_samples: 512
   min_composition_score: 0.72
-  min_camera_height_m: 1.00
+  # The capture-centre horizontal orbit is 0.995 m above this scene's floor;
+  # keep it instead of rejecting it for a 5 mm numerical/asset-boundary mismatch.
+  min_camera_height_m: 0.98
   max_camera_height_m: 2.40
-  max_camera_distance_m: 4.20
+  max_camera_distance_m: 4.50
   distance_preference_weight: 0.15
   azimuth_count: 24
   azimuth_refinement_rounds: 3
