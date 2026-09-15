@@ -277,6 +277,13 @@ class TargetViewSettings(StrictModel):
     insertion_shortlist: int = Field(default=12, ge=2, le=64)
     selection_starts: int = Field(default=3, ge=1, le=8)
     max_path_queries: int = Field(default=300, ge=10, le=5000)
+    # Acquisition stops use the strict thresholds above.  A moving camera is
+    # allowed to pass through weaker-but-still-usable views so that the tour is
+    # not rejected merely because every interpolated frame is not itself a
+    # publishable reconstruction view.
+    transition_view_policy: Literal["strict", "relaxed", "clearance_only"] = "relaxed"
+    transition_min_visibility_fraction: float = Field(default=0.35, ge=0, le=1)
+    transition_min_extent_ratio: float = Field(default=0.06, ge=0, lt=1)
     transition_check_step_m: float = Field(default=0.15, gt=0)
     max_transition_view_checks: int = Field(default=60000, ge=100, le=1000000)
 
@@ -298,6 +305,14 @@ class TargetViewSettings(StrictModel):
         if self.min_candidate_composition_score > self.min_composition_score:
             raise ValueError(
                 "candidate composition floor cannot exceed final-camera composition floor"
+            )
+        if self.transition_min_visibility_fraction > self.min_visibility_fraction:
+            raise ValueError(
+                "transition visibility floor cannot exceed final-camera visibility floor"
+            )
+        if self.transition_min_extent_ratio > self.min_extent_ratio:
+            raise ValueError(
+                "transition extent floor cannot exceed final-camera extent floor"
             )
         if (
             self.shadow_prefilter_enabled

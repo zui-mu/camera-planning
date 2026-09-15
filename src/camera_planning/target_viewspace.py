@@ -311,6 +311,71 @@ class ViewEvaluator:
             "composition": float(composition),
         }, None
 
+    def transition_view(self, position):
+        """Apply the deliberately weaker view contract used between acquisition stops.
+
+        Final cameras still go through :meth:`evaluate`.  During motion we only
+        require collision-safe placement (also checked by ``FreeGrid``), a
+        non-trivial projected target size, and enough visible target surface to
+        avoid an obviously blind/fully occluded shot.  The expanded interaction
+        region and publication-quality margins are intentionally not hard path
+        constraints.
+        """
+        position = np.asarray(position, float)
+        req, s = self.request, self.s
+        clearance = req.candidates.camera_clearance_m
+        if not inside_box(position, req.allowed_camera_region, -clearance):
+            return None, "transition_outside_camera_region"
+        if self.geometry.occupied(position[None], clearance)[0]:
+            return None, "transition_camera_collision"
+        if abs(np.dot(unit(self.focus - position), self.up)) > 0.995:
+            return None, "transition_vertical_look_at_singularity"
+        if s.transition_view_policy == "clearance_only":
+            return {"policy": "clearance_only"}, None
+        if s.transition_view_policy == "strict":
+            return self.evaluate(position)
+
+        camera = look_at(position, self.focus, self.up, req.intrinsics, "transition")
+        uv, depth = project(camera, self.framing_corners)
+        if (depth <= 0.01).any():
+            return None, "transition_target_behind_near_plane"
+        xy = uv / [camera.width, camera.height]
+        extent = float(np.ptp(xy, axis=0).max())
+        if extent < s.transition_min_extent_ratio:
+            return None, "transition_target_too_small"
+
+        facing = np.einsum("ij,ij->i", self.normals, position - self.surface) > 1e-8
+        if not facing.any():
+            return None, "transition_no_front_facing_samples"
+        points = self.surface[facing]
+        endpoints = points + (position - points) * 1e-6
+        pix, z = project(camera, points)
+        in_frame = (z > 0.01) & np.all(
+            (pix >= 0) & (pix <= [camera.width, camera.height]), axis=1
+        )
+        blocked = self.geometry.blocked(position, endpoints)
+        strictly_visible = in_frame & ~blocked
+        if self.support_ids:
+            blocked_without_support = self.geometry.blocked(
+                position,
+                endpoints,
+                exclude_object_ids=self.support_ids,
+            )
+            support_only = in_frame & blocked & ~blocked_without_support
+        else:
+            support_only = np.zeros(len(points), dtype=bool)
+        credit = strictly_visible.astype(float)
+        credit[support_only] = 1.0 - s.supported_target_occlusion_penalty
+        visibility = float(credit.mean())
+        if visibility < s.transition_min_visibility_fraction:
+            return None, "transition_target_heavily_occluded"
+        return {
+            "policy": "relaxed",
+            "visibility": visibility,
+            "strict_target_visibility": float(strictly_visible.mean()),
+            "projected_extent_ratio": extent,
+        }, None
+
     def projected_extent_ratio(self, direction, radius):
         """Largest normalized hard-framing extent at one orbit radius."""
         direction = unit(direction)
@@ -813,7 +878,7 @@ def diverse_indices(records, count):
 
 
 class TargetPathGrid(FreeGrid):
-    """Camera clearance plus sampled target framing/visibility on every searched edge."""
+    """Camera clearance plus the configured moving-shot view contract."""
     def __init__(self, evaluator):
         req = evaluator.request
         super().__init__(req.allowed_camera_region, req.path.voxel_size_m, evaluator.geometry,
@@ -821,6 +886,7 @@ class TargetPathGrid(FreeGrid):
         self.validation_step = req.path.validation_step_m
         self.evaluator = evaluator
         self.view_cache = {}
+        self.view_rejections = Counter()
 
     def segment_clear(self, a, b):
         if not super().segment_clear(a, b):
@@ -830,8 +896,12 @@ class TargetPathGrid(FreeGrid):
             key = tuple(np.round(position, 7))
             if key not in self.view_cache:
                 if len(self.view_cache) >= self.evaluator.s.max_transition_view_checks:
+                    self.view_rejections["transition_view_check_budget_exhausted"] += 1
                     return False
-                self.view_cache[key] = self.evaluator.evaluate(position)[0] is not None
+                _, reason = self.evaluator.transition_view(position)
+                self.view_cache[key] = reason is None
+                if reason is not None:
+                    self.view_rejections[reason] += 1
             if not self.view_cache[key]:
                 return False
         return True
@@ -1016,6 +1086,10 @@ def select_tour(evaluator, records):
     diagnostics = {"path_queries": queries, "path_query_cap": s.max_path_queries,
                    "transition_view_checks": len(grid.view_cache),
                    "transition_view_check_cap": s.max_transition_view_checks,
+                   "transition_view_policy": s.transition_view_policy,
+                   "transition_min_visibility_fraction": s.transition_min_visibility_fraction,
+                   "transition_min_extent_ratio": s.transition_min_extent_ratio,
+                   "transition_view_rejections": dict(grid.view_rejections),
                    "starts": partial, "angular_reference_count": int(reachable.sum()),
                    "angular_reference_semantics": "uniform horizontal azimuth bins near feasible candidates",
                    "selection_policy": "quality/diversity set first; exact open route second",
@@ -1036,7 +1110,13 @@ def select_tour(evaluator, records):
             "length_unit": "meter", "length_m": metrics["path_length_m"],
             "geometry_backend": evaluator.geometry.name,
             "selection_coupling": "bounded multi-start greedy camera set, then exact open ordering",
-            "safety_model": "geometry clearance; target composition/visibility sampled along edges",
+            "safety_model": (
+                "geometry clearance plus configured moving-shot target visibility; "
+                "strict acquisition composition applies only at selected stops"
+            ),
+            "transition_view_policy": s.transition_view_policy,
+            "transition_min_visibility_fraction": s.transition_min_visibility_fraction,
+            "transition_min_extent_ratio": s.transition_min_extent_ratio,
             "transition_check_step_m": s.transition_check_step_m,
             "focus_world_m": evaluator.focus.tolist(), "world_up": evaluator.up.tolist(),
             "orientation_policy": "look_at_fixed_target_aim",

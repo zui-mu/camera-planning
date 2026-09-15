@@ -256,3 +256,68 @@ class MeshViewValidator:
                     if self.support_aware
                     else "uniform image-grid mesh rays; finite silhouette-area estimate"
                 )}
+
+    def check_transition(self, spec):
+        """Looser validation for frames between selected acquisition cameras."""
+        r, t, k = (np.asarray(spec[key], float) for key in ("R", "T", "K"))
+        center = -r.T @ t
+        height_above_floor = float(center[self.up_index] - self.request["floor_height_m"])
+        camera_distance = float(np.linalg.norm(center - self.focus))
+        if not self.s["min_camera_height_m"] <= height_above_floor <= self.s["max_camera_height_m"]:
+            return {"valid": False, "reason": "transition_actual_mesh_camera_height",
+                    "height_above_floor_m": height_above_floor, "distance_m": camera_distance}
+        if camera_distance > self.s["max_camera_distance_m"]:
+            return {"valid": False, "reason": "transition_actual_mesh_camera_distance",
+                    "height_above_floor_m": height_above_floor, "distance_m": camera_distance}
+
+        camera_points = self.framing_corners @ r.T + t
+        if (camera_points[:, 2] <= 0.01).any():
+            return {"valid": False, "reason": "transition_target_behind_camera"}
+        pix = camera_points @ k.T
+        uv = pix[:, :2] / pix[:, 2, None]
+        low, high = uv.min(axis=0), uv.max(axis=0)
+        ratios_low = low / [spec["width"], spec["height"]]
+        ratios_high = high / [spec["width"], spec["height"]]
+        wh = ratios_high - ratios_low
+        extent = float(max(wh))
+        extent_floor = self.s.get("transition_min_extent_ratio", 0.06)
+        if extent < extent_floor:
+            return {"valid": False, "reason": "transition_mesh_target_too_small",
+                    "extent": extent, "distance_m": camera_distance,
+                    "height_above_floor_m": height_above_floor}
+
+        size = max(3, int(np.ceil(np.sqrt(self.s.get("visibility_samples", 64) / 2))))
+        xs = low[0] + (np.arange(size) + 0.5) / size * (high[0] - low[0])
+        ys = low[1] + (np.arange(size) + 0.5) / size * (high[1] - low[1])
+        inverse_k = np.linalg.inv(k)
+        hits = 0
+        visibility_credit = 0.0
+        origin = Vector(center / self.scale)
+        for x, y in itertools.product(xs, ys):
+            direction = Vector(r.T @ (inverse_k @ [x, y, 1.0])).normalized()
+            location, _, _, hit_distance = self.bvh.ray_cast(origin, direction)
+            if location is None:
+                continue
+            hits += 1
+            result = bpy.context.scene.ray_cast(
+                self.deps, origin, direction, distance=hit_distance + 1e-4 / self.scale
+            )
+            if result[0] and (result[4].original.name == self.name or
+                              (result[1] - location).length < 1e-5 / self.scale):
+                visibility_credit += 1.0
+            elif result[0] and result[4].original.name in self.support_names:
+                visibility_credit += 1.0 - self.s.get(
+                    "supported_target_occlusion_penalty", 0.15
+                )
+
+        fraction = visibility_credit / hits if hits else 0.0
+        visibility_floor = self.s.get("transition_min_visibility_fraction", 0.35)
+        valid = bool(hits > 0 and fraction >= visibility_floor)
+        return {"valid": valid,
+                "reason": None if valid else "transition_actual_mesh_target_heavily_occluded",
+                "target_hit_rays": hits,
+                "visible_fraction": fraction,
+                "extent": extent,
+                "distance_m": camera_distance,
+                "height_above_floor_m": height_above_floor,
+                "semantics": "relaxed transition mesh visibility"}

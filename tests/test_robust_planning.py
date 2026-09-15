@@ -183,6 +183,42 @@ def test_shadow_prefilter_must_be_looser_than_final_visibility():
         )
 
 
+def test_transition_thresholds_must_not_be_stricter_than_final_views():
+    with pytest.raises(ValueError, match="transition visibility floor"):
+        TargetViewSettings(
+            min_visibility_fraction=0.80,
+            transition_min_visibility_fraction=0.81,
+        )
+    with pytest.raises(ValueError, match="transition extent floor"):
+        TargetViewSettings(
+            min_extent_ratio=0.18,
+            transition_min_extent_ratio=0.19,
+        )
+
+
+def test_relaxed_transition_does_not_require_strict_composition_margins():
+    request = tiny_request()
+    request.target_view.min_camera_height_m = 0.1
+    request.target_view.max_camera_height_m = 3.0
+    request.target_view.min_visibility_fraction = 0.0
+    request.target_view.min_capture_visibility_fraction = 0.0
+    request.target_view.transition_min_visibility_fraction = 0.0
+    request.target_view.transition_min_extent_ratio = 0.01
+    request.target_view.side_margin_ratio = 0.30
+    request.target_view.top_margin_ratio = 0.30
+    request.target_view.bottom_margin_ratio = 0.30
+    request.target_view.transition_view_policy = "relaxed"
+    evaluator = ViewEvaluator(request, AABBGeometry([request.target]))
+    position = np.array([0.0, 1.0, 1.2])
+
+    _, strict_reason = evaluator.evaluate(position)
+    relaxed, relaxed_reason = evaluator.transition_view(position)
+
+    assert strict_reason == "composition_too_tight"
+    assert relaxed_reason is None
+    assert relaxed["policy"] == "relaxed"
+
+
 def test_framing_shell_has_a_projected_size_far_boundary():
     request = tiny_request()
     request.target_view.min_extent_ratio = 0.40

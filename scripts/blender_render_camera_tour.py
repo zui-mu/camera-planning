@@ -236,7 +236,7 @@ def collision_failures(samples, request):
     return failures
 
 
-def mesh_view_failures(samples, specs, evaluator):
+def mesh_view_failures(samples, specs, evaluator, *, transition=False):
     from mathutils import Quaternion
 
     failures = []
@@ -246,7 +246,8 @@ def mesh_view_failures(samples, specs, evaluator):
             @ Quaternion(sample["rotation"]).to_matrix().transposed()
         )
         translation = -(rotation @ Vector(sample["position"]))
-        check = evaluator.check(
+        check_fn = evaluator.check_transition if transition else evaluator.check
+        check = check_fn(
             {**specs[0], "R": [list(row) for row in rotation], "T": list(translation)}
         )
         if not check["valid"]:
@@ -358,7 +359,7 @@ def main():
             )
             trial_collisions = collision_failures(trial_samples, request)
             trial_bad_views = (
-                mesh_view_failures(trial_samples, trial_specs, evaluator)
+                mesh_view_failures(trial_samples, trial_specs, evaluator, transition=True)
                 if evaluator is not None and not trial_collisions
                 else []
             )
@@ -383,8 +384,8 @@ def main():
             report_path.write_text(json.dumps({
                 "status": "failed",
                 "smoothing_attempts": smoothing_attempts,
-                "reason": "no collision-and-view-valid smooth or linear trajectory",
-            }, indent=2), encoding="utf-8")
+            "reason": "no collision-and-transition-view-valid smooth or linear trajectory",
+        }, indent=2), encoding="utf-8")
             raise ValueError(f"tour curve fitting failed; see {report_path}")
         specs, samples, arrival_frames, collision_samples, bad_frames = accepted
         ids = [spec["camera_id"] for spec in specs]
@@ -401,7 +402,7 @@ def main():
 
             bpy.context.scene.frame_set(args.frame)
             evaluator = MeshViewValidator(request)
-            bad_frames = mesh_view_failures(samples, specs, evaluator)
+            bad_frames = mesh_view_failures(samples, specs, evaluator, transition=False)
         report_path = output_video.parent / "trajectory_view_validation.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps({"checked_frames": len(samples), "failures": bad_frames,
@@ -409,6 +410,7 @@ def main():
             "collision_failures": collision_samples,
             "collision_backend": "AABB proxy and declared allowed region",
             "geometry_backend": "Blender evaluated scene mesh ray casts",
+            "view_policy": "relaxed transition" if path_plan else "strict legacy tour",
             "smoothing_strength": smoothing_strength,
             "smoothing_attempts": smoothing_attempts}, indent=2), encoding="utf-8")
         if bad_frames or collision_samples:

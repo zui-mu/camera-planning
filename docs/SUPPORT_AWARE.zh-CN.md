@@ -64,3 +64,16 @@ min_interaction_visibility_fraction: 0.55
 ```
 
 如果没有检测到附属物体，程序自动回到原来的扩展 capture box 逻辑，既有沙发实验不会因桌面专用代理被重新解释。
+
+## 6. 正式机位与连续运镜使用不同门槛
+
+最终选中的采集机位仍必须满足完整的家具构图、目标可见率、交互区域可见率和单机质量门槛。连续运镜的中间帧默认使用 `relaxed` 规则：路径不能穿过场景几何；目标家具必须保留非平凡的投影大小；家具表面可见率不能低于较宽松的过渡阈值。中间帧不再被要求完整满足预留交互区域覆盖和正式机位构图边距。
+
+```yaml
+transition_view_policy: relaxed
+transition_min_visibility_fraction: 0.35
+transition_min_extent_ratio: 0.06
+transition_check_step_m: 0.15
+```
+
+`strict` 可用于消融实验，恢复“每个路径检查点都必须是合格采集机位”的旧行为；`clearance_only` 仅检查路径几何安全，通常只适合调试。
