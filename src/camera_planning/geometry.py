@@ -78,6 +78,7 @@ class GeometryBackend(Protocol):
         origin: np.ndarray,
         endpoints: np.ndarray,
         exclude_object_id: str | None = None,
+        exclude_object_ids: set[str] | frozenset[str] | None = None,
     ) -> np.ndarray: ...
     def occupied(self, points: np.ndarray, clearance: float = 0.0) -> np.ndarray: ...
     def object_vertices(self, object_id: str) -> np.ndarray: ...
@@ -169,11 +170,20 @@ class AABBGeometry:
             )
         return result
 
-    def blocked(self, origin, endpoints, exclude_object_id=None):
-        if exclude_object_id is None:
+    def blocked(
+        self,
+        origin,
+        endpoints,
+        exclude_object_id=None,
+        exclude_object_ids=None,
+    ):
+        excluded = set(exclude_object_ids or ())
+        if exclude_object_id is not None:
+            excluded.add(exclude_object_id)
+        if not excluded:
             lows, highs = self._lows, self._highs
         else:
-            keep = np.asarray([box.object_id != exclude_object_id for box in self.boxes])
+            keep = np.asarray([box.object_id not in excluded for box in self.boxes])
             lows, highs = self._lows[keep], self._highs[keep]
             if not len(lows):
                 return np.zeros(len(endpoints), dtype=bool)
@@ -199,7 +209,9 @@ class AABBGeometry:
 
 def load_geometry(request):
     if request.geometry.backend == "aabb":
-        return AABBGeometry([request.target, *request.obstacles])
+        return AABBGeometry(
+            [request.target, *request.supported_objects, *request.obstacles]
+        )
     from .mesh_geometry import TriangleMeshGeometry
 
     return TriangleMeshGeometry.from_npz(

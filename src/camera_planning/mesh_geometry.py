@@ -228,7 +228,7 @@ class TriangleMeshGeometry:
         node.right = self._build(order[midpoint:])
         return node_index
 
-    def _segment_hits(self, origin, endpoint, exclude_object_index=None):
+    def _segment_hits(self, origin, endpoint, exclude_object_indices=None):
         direction = endpoint - origin
         if np.linalg.norm(direction) < 1e-12:
             return np.empty(0)
@@ -239,21 +239,32 @@ class TriangleMeshGeometry:
                 continue
             if node.triangles is not None:
                 indices = node.triangles
-                if exclude_object_index is not None:
-                    indices = indices[self.face_object_indices[indices] != exclude_object_index]
+                if exclude_object_indices:
+                    indices = indices[
+                        ~np.isin(self.face_object_indices[indices], list(exclude_object_indices))
+                    ]
                 hits.extend(_ray_triangle_t(origin, direction, self.triangles[indices]))
             else:
                 stack.extend((node.left, node.right))
         return np.asarray(hits)
 
-    def blocked(self, origin, endpoints, exclude_object_id=None):
+    def blocked(
+        self,
+        origin,
+        endpoints,
+        exclude_object_id=None,
+        exclude_object_ids=None,
+    ):
         origin = np.asarray(origin, dtype=float)
-        excluded = None
+        names = set(exclude_object_ids or ())
         if exclude_object_id is not None:
+            names.add(exclude_object_id)
+        excluded = set()
+        for name in names:
             try:
-                excluded = self.object_ids.index(exclude_object_id)
+                excluded.add(self.object_ids.index(name))
             except ValueError:
-                excluded = None
+                pass
         return np.array(
             [
                 bool(len(self._segment_hits(origin, endpoint, excluded)))

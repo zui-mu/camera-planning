@@ -18,7 +18,7 @@ def camera_world(spec):
     return matrix
 
 
-def add_box(collection, minimum, maximum):
+def add_box(collection, minimum, maximum, name="CameraPlan_TargetBounds", color=(1.0, 0.55, 0.05, 1.0)):
     minimum, maximum = np.array(minimum), np.array(maximum)
     vertices = [
         (x, y, z)
@@ -40,10 +40,10 @@ def add_box(collection, minimum, maximum):
         (5, 7),
         (6, 7),
     ]
-    mesh = bpy.data.meshes.new("CameraPlan_TargetBounds")
+    mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(vertices, edges, [])
-    obj = bpy.data.objects.new("CameraPlan_TargetBounds", mesh)
-    obj.color = (1.0, 0.55, 0.05, 1.0)
+    obj = bpy.data.objects.new(name, mesh)
+    obj.color = color
     collection.objects.link(obj)
 
 
@@ -109,6 +109,14 @@ def main():
     if args.request:
         request = json.loads(Path(args.request).read_text(encoding="utf-8"))
         add_box(diagnostics, request["target"]["minimum"], request["target"]["maximum"])
+        for index, box in enumerate(request.get("supported_objects", [])):
+            add_box(
+                diagnostics,
+                box["minimum"],
+                box["maximum"],
+                f"CameraPlan_SupportedObject_{index:02d}",
+                (0.58, 0.45, 0.95, 1.0),
+            )
     if args.evidence:
         with np.load(args.evidence, allow_pickle=False) as evidence:
             points = evidence["points"].copy()
@@ -152,6 +160,27 @@ def main():
                 add_points(
                     diagnostics, "CameraPlan_FreeSpace", points[kinds == 2], (0.1, 0.55, 1.0, 1.0)
                 )
+        if np.any(kinds == 4):
+            add_points(
+                diagnostics,
+                "CameraPlan_FreeSupportAnchors",
+                points[kinds == 4],
+                (0.05, 0.75, 0.42, 1.0),
+            )
+        if np.any(kinds == 5):
+            add_points(
+                diagnostics,
+                "CameraPlan_OccupiedSupportAnchors",
+                points[kinds == 5],
+                (0.95, 0.15, 0.12, 1.0),
+            )
+        if np.any(kinds == 6):
+            add_points(
+                diagnostics,
+                "CameraPlan_UnknownHumanInteractionSamples",
+                points[kinds == 6],
+                (0.10, 0.50, 1.0, 1.0),
+            )
         path_file = Path(args.evidence).parent / "camera_path.json"
         if path_file.is_file():
             path_data = json.loads(path_file.read_text(encoding="utf-8"))

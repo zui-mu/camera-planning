@@ -180,6 +180,25 @@ class TargetViewSettings(StrictModel):
     capture_bottom_padding_m: float = Field(default=0.0, ge=0)
     capture_visibility_samples: int = Field(default=128, ge=24, le=4096)
     min_capture_visibility_fraction: float = Field(default=0.90, ge=0, le=1)
+    # Objects resting on the target (monitor, lamp, books, etc.) are a third
+    # semantic/geometric role.  They remain solid for camera/path collision and
+    # for future-human visibility, but their occlusion of furniture appearance
+    # is discounted.  Detection is deliberately geometric and auditable.
+    support_detection_enabled: bool = True
+    support_max_vertical_gap_m: float = Field(default=0.035, ge=0, le=0.25)
+    support_max_vertical_penetration_m: float = Field(default=0.015, ge=0, le=0.25)
+    support_min_footprint_overlap_fraction: float = Field(default=0.50, gt=0, le=1)
+    support_max_footprint_area_ratio: float = Field(default=0.80, gt=0, le=2)
+    supported_target_occlusion_penalty: float = Field(default=0.15, ge=0, le=1)
+    # If support objects are detected, a deterministic free-space proxy is
+    # sampled above the unoccupied part of the support surface.  This is an
+    # unknown-human interaction domain, not a predicted pose.
+    interaction_anchor_count: int = Field(default=64, ge=4, le=1024)
+    interaction_height_offsets_m: list[float] = Field(
+        default_factory=lambda: [0.15, 0.50, 0.90, 1.30], min_length=1, max_length=16
+    )
+    interaction_clearance_m: float = Field(default=0.08, ge=0, le=0.50)
+    min_interaction_visibility_fraction: float = Field(default=0.55, ge=0, le=1)
     # Cheap first-stage test of the finite camera-to-capture-box corridor.  It
     # removes only 3-D positions whose corridor is already clearly occluded;
     # it never removes a whole azimuth merely because an obstacle is on the floor.
@@ -283,12 +302,33 @@ class TargetViewSettings(StrictModel):
         if (
             self.shadow_prefilter_enabled
             and self.shadow_prefilter_min_visible_fraction
-            > self.min_capture_visibility_fraction
+            > min(
+                self.min_capture_visibility_fraction,
+                self.min_interaction_visibility_fraction,
+            )
         ):
             raise ValueError(
-                "shadow prefilter must be looser than the authoritative capture visibility test"
+                "shadow prefilter must be looser than the authoritative capture/interaction visibility test"
             )
+        if not np.all(np.isfinite(self.interaction_height_offsets_m)) or min(
+            self.interaction_height_offsets_m
+        ) <= 0:
+            raise ValueError("interaction height offsets must be finite and positive")
         return self
+
+
+class InteractionRegion(StrictModel):
+    """Finite, geometry-only proxy for unknown human interaction around a support surface."""
+
+    mode: Literal["support_surface_free_volume_v1"] = "support_surface_free_volume_v1"
+    free_anchor_points_world_m: list[tuple[float, float, float]] = Field(default_factory=list)
+    occupied_anchor_points_world_m: list[tuple[float, float, float]] = Field(default_factory=list)
+    sample_points_world_m: list[tuple[float, float, float]] = Field(default_factory=list)
+    support_object_ids: list[str] = Field(default_factory=list)
+    semantics: str = (
+        "pose-agnostic vertical proxy samples above free support-surface anchors; "
+        "points colliding with target, supported objects, or other obstacles are removed"
+    )
 
 
 class PlanningRequest(StrictModel):
@@ -301,6 +341,8 @@ class PlanningRequest(StrictModel):
     planning_mode: Literal["legacy", "target_viewspace"] = "legacy"
     target_obb: TargetOBB | None = None
     target_view: TargetViewSettings = Field(default_factory=TargetViewSettings)
+    supported_objects: list[Box] = Field(default_factory=list)
+    interaction_region: InteractionRegion | None = None
     obstacles: list[Box] = Field(default_factory=list)
     allowed_camera_region: Box
     budget: int = Field(default=4, ge=2, le=64)
@@ -336,9 +378,19 @@ class PlanningRequest(StrictModel):
 
     @model_validator(mode="after")
     def unique_ids(self):
-        ids = [self.target.object_id] + [box.object_id for box in self.obstacles]
+        ids = (
+            [self.target.object_id]
+            + [box.object_id for box in self.supported_objects]
+            + [box.object_id for box in self.obstacles]
+        )
         if len(ids) != len(set(ids)):
-            raise ValueError("target is automatically an occluder; do not duplicate object_id")
+            raise ValueError("target/support/obstacle roles must have unique object_id values")
+        if self.interaction_region is not None:
+            declared = {box.object_id for box in self.supported_objects}
+            if set(self.interaction_region.support_object_ids) != declared:
+                raise ValueError("interaction support ids must match supported_objects")
+            if not self.interaction_region.sample_points_world_m:
+                raise ValueError("interaction region must contain at least one free sample")
         return self
 
     @property

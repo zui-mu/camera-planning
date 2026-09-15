@@ -12,6 +12,10 @@ class MeshViewValidator:
     def __init__(self, request):
         self.request = request
         self.s = request["target_view"]
+        self.support_names = {
+            item["object_id"] for item in request.get("supported_objects", [])
+        }
+        self.support_aware = request.get("interaction_region") is not None
         for obj in bpy.context.scene.objects:
             if obj.hide_render:
                 obj.hide_set(True)
@@ -78,6 +82,12 @@ class MeshViewValidator:
             capture_half,
             self.s.get("capture_visibility_samples", 128),
         )
+        if self.support_aware:
+            self.coverage_points = np.asarray(
+                request["interaction_region"]["sample_points_world_m"], float
+            )
+        else:
+            self.coverage_points = self.capture_surface
 
     @staticmethod
     def _sample_box_surface(center, axes, half, count):
@@ -118,6 +128,22 @@ class MeshViewValidator:
             start = result[1] + direction * epsilon
         return True
 
+    def _scene_blocked(self, camera_center, endpoint):
+        """Any real object blocks an unknown-human proxy point in free space."""
+        start = Vector(camera_center / self.scale)
+        finish = Vector(endpoint / self.scale)
+        delta = finish - start
+        distance = delta.length
+        if distance <= 1e-5 / self.scale:
+            return False
+        result = bpy.context.scene.ray_cast(
+            self.deps,
+            start,
+            delta.normalized(),
+            distance=max(0.0, distance - 1e-5 / self.scale),
+        )
+        return bool(result[0])
+
     def check(self, spec):
         r, t, k = (np.asarray(spec[key], float) for key in ("R", "T", "K"))
         center = -r.T @ t
@@ -146,7 +172,8 @@ class MeshViewValidator:
         xs = low[0] + (np.arange(size) + 0.5) / size * (high[0] - low[0])
         ys = low[1] + (np.arange(size) + 0.5) / size * (high[1] - low[1])
         inverse_k = np.linalg.inv(k)
-        hits = visible = 0
+        hits = strict_visible = 0
+        visibility_credit = 0.0
         origin = Vector(center / self.scale)
         for x, y in itertools.product(xs, ys):
             direction = Vector(r.T @ (inverse_k @ [x, y, 1.0])).normalized()
@@ -158,9 +185,15 @@ class MeshViewValidator:
                                                distance=hit_distance + 1e-4 / self.scale)
             if result[0] and (result[4].original.name == self.name or
                               (result[1] - location).length < 1e-5 / self.scale):
-                visible += 1
-        fraction = visible / hits if hits else 0.0
-        capture_camera = self.capture_surface @ r.T + t
+                strict_visible += 1
+                visibility_credit += 1.0
+            elif result[0] and result[4].original.name in self.support_names:
+                visibility_credit += 1.0 - self.s.get(
+                    "supported_target_occlusion_penalty", 0.15
+                )
+        fraction = visibility_credit / hits if hits else 0.0
+        strict_fraction = strict_visible / hits if hits else 0.0
+        capture_camera = self.coverage_points @ r.T + t
         capture_pixels = capture_camera @ k.T
         capture_uv = capture_pixels[:, :2] / capture_pixels[:, 2, None]
         capture_in_frame = (capture_camera[:, 2] > 0.01) & np.all(
@@ -168,7 +201,12 @@ class MeshViewValidator:
         )
         capture_visible = capture_in_frame.copy()
         for index in np.flatnonzero(capture_in_frame):
-            capture_visible[index] = not self._externally_blocked(center, self.capture_surface[index])
+            endpoint = self.coverage_points[index]
+            capture_visible[index] = not (
+                self._scene_blocked(center, endpoint)
+                if self.support_aware
+                else self._externally_blocked(center, endpoint)
+            )
         capture_fraction = float(capture_visible.mean())
         fill = float(min(1.0, max(wh[0] / s["max_width_ratio"], wh[1] / s["max_height_ratio"])))
         proximity = max(0.0, 1.0 - camera_distance / s["max_camera_distance_m"])
@@ -176,23 +214,45 @@ class MeshViewValidator:
         # Match the planner semantics: target visibility is strict, while the
         # expanded capture region is a weaker preference that camera sets may
         # satisfy collectively through complementary viewpoints.
-        composition = float(remaining * (
-            0.5 * fraction + 0.3 * fill + 0.2 * capture_fraction
-        ) + s["distance_preference_weight"] * proximity)
+        if self.support_aware:
+            composition = float(remaining * (
+                0.25 * fraction + 0.30 * fill + 0.45 * capture_fraction
+            ) + s["distance_preference_weight"] * proximity)
+        else:
+            composition = float(remaining * (
+                0.5 * fraction + 0.3 * fill + 0.2 * capture_fraction
+            ) + s["distance_preference_weight"] * proximity)
+        evidence_floor = (
+            s.get("min_interaction_visibility_fraction", 0.55)
+            if self.support_aware
+            else s.get("min_capture_visibility_fraction", 0.90)
+        )
         valid = bool(hits > 0 and fraction >= s["min_visibility_fraction"]
-                     and capture_fraction >= s.get("min_capture_visibility_fraction", 0.90)
+                     and capture_fraction >= evidence_floor
                      and composition >= s["min_composition_score"])
         reason = None
         if fraction < s["min_visibility_fraction"]:
             reason = "actual_mesh_target_occlusion"
-        elif capture_fraction < s.get("min_capture_visibility_fraction", 0.90):
-            reason = "actual_mesh_capture_corridor_occlusion"
+        elif capture_fraction < evidence_floor:
+            reason = (
+                "actual_mesh_interaction_region_occlusion"
+                if self.support_aware
+                else "actual_mesh_capture_corridor_occlusion"
+            )
         elif composition < s["min_composition_score"]:
             reason = "actual_mesh_composition_score"
         return {"valid": valid, "reason": reason,
-                "target_hit_rays": hits, "visible_target_rays": visible,
+                "target_hit_rays": hits, "visible_target_rays": strict_visible,
                 "visible_fraction": fraction,
+                "strict_target_visible_fraction": strict_fraction,
                 "capture_visibility_fraction": capture_fraction,
+                "interaction_visibility_fraction": (
+                    capture_fraction if self.support_aware else None
+                ),
                 "fill": fill, "composition": composition,
                 "distance_m": camera_distance, "height_above_floor_m": height_above_floor,
-                "semantics": "uniform image-grid mesh rays; finite silhouette-area estimate"}
+                "semantics": (
+                    "support-aware target identity plus all-solid unknown-human proxy rays"
+                    if self.support_aware
+                    else "uniform image-grid mesh rays; finite silhouette-area estimate"
+                )}

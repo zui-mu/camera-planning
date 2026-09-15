@@ -1,7 +1,9 @@
 """Target-centred view generation and bounded, path-aware open-tour selection.
 
-This module never samples hypothetical human positions. Visibility is a sampled
-surface proxy supplied by the geometry backend, not rendered segmentation area.
+This module never predicts a human pose.  When target-supported context is
+detected, it samples a geometry-only free interaction volume; otherwise it uses
+the original expanded target-box evidence.  Visibility remains a geometric ray
+proxy supplied by the backend, not rendered segmentation area.
 """
 
 import itertools
@@ -101,20 +103,43 @@ class ViewEvaluator:
             self.s.capture_visibility_samples,
             29,
         )
+        self.support_ids = frozenset(
+            box.object_id for box in request.supported_objects
+        )
+        self.support_aware = request.interaction_region is not None
+        self.interaction_points = (
+            np.asarray(request.interaction_region.sample_points_world_m, dtype=float)
+            if self.support_aware
+            else np.empty((0, 3), dtype=float)
+        )
+        self.coverage_points = (
+            self.interaction_points if self.support_aware else self.capture_surface
+        )
+        self.coverage_semantics = (
+            "collision-free unknown-human support-volume samples"
+            if self.support_aware
+            else "expanded target-box boundary samples"
+        )
         self.framing_corners = (
             self.target_corners if self.s.framing_region == "target" else self.corners
         )
         # A separate, much smaller deterministic set defines a lazy 3-D shadow
-        # prefilter.  Rays from a queried camera position to these points are a
-        # sampled proxy for the convex observation corridor to the capture box.
-        # The full target/capture visibility checks below remain authoritative.
-        self.shadow_surface = sample_box_surface(
-            capture_center,
-            capture_axes,
-            capture_half,
-            self.s.shadow_prefilter_samples,
-            43,
-        )
+        # prefilter.  It follows the active evidence domain (free interaction
+        # volume or capture boundary).  Full visibility checks remain authoritative.
+        if self.support_aware:
+            shadow_count = min(self.s.shadow_prefilter_samples, len(self.coverage_points))
+            shadow_indices = np.linspace(
+                0, len(self.coverage_points) - 1, shadow_count, dtype=int
+            )
+            self.shadow_surface = self.coverage_points[shadow_indices]
+        else:
+            self.shadow_surface = sample_box_surface(
+                capture_center,
+                capture_axes,
+                capture_half,
+                self.s.shadow_prefilter_samples,
+                43,
+            )
         self.center = self.target_corners.mean(axis=0)
         self.up = np.eye(3)[request.up_index]
         self.scale = max(float(np.linalg.norm(np.ptp(self.corners, axis=0))), 1e-3)
@@ -166,7 +191,9 @@ class ViewEvaluator:
         blocked = self.geometry.blocked(
             position,
             endpoints,
-            exclude_object_id=self.request.target.object_id,
+            exclude_object_id=(
+                None if self.support_aware else self.request.target.object_id
+            ),
         )
         visible_fraction = float((~blocked).mean())
         if visible_fraction < self.s.shadow_prefilter_min_visible_fraction:
@@ -205,27 +232,49 @@ class ViewEvaluator:
         endpoints = points + (position - points) * 1e-6
         pix, z = project(camera, points)
         in_frame = (z > 0.01) & np.all((pix >= 0) & (pix <= [camera.width, camera.height]), axis=1)
-        visible = in_frame & ~self.geometry.blocked(position, endpoints)
-        visibility = float(visible.mean())
+        blocked = self.geometry.blocked(position, endpoints)
+        strictly_visible = in_frame & ~blocked
+        if self.support_ids:
+            blocked_without_support = self.geometry.blocked(
+                position,
+                endpoints,
+                exclude_object_ids=self.support_ids,
+            )
+            support_only = in_frame & blocked & ~blocked_without_support
+        else:
+            support_only = np.zeros(len(points), dtype=bool)
+        visibility_credit = strictly_visible.astype(float)
+        visibility_credit[support_only] = 1.0 - s.supported_target_occlusion_penalty
+        visibility = float(visibility_credit.mean())
+        strict_visibility = float(strictly_visible.mean())
         if visibility < s.min_visibility_fraction:
             return None, "target_occluded"
-        # The expanded capture box is a conservative region in which a future
-        # person may appear.  It is allowed to be only partly visible in one view;
-        # set selection later rewards union and multi-view coverage.  Exclude the
-        # target itself so this measures external scene occlusion only.
-        capture_pix, capture_depth = project(camera, self.capture_surface)
+        # The active evidence is either the support-aware free interaction volume
+        # or the legacy expanded capture boundary.  Interaction rays keep target
+        # and supported objects solid; legacy capture rays exclude target self-occlusion.
+        evidence_points = self.coverage_points
+        capture_pix, capture_depth = project(camera, evidence_points)
         capture_in_frame = (capture_depth > 0.01) & np.all(
             (capture_pix >= 0) & (capture_pix <= [camera.width, camera.height]), axis=1
         )
-        capture_endpoints = self.capture_surface + (position - self.capture_surface) * 1e-6
+        capture_endpoints = evidence_points + (position - evidence_points) * 1e-6
         capture_visible = capture_in_frame & ~self.geometry.blocked(
             position,
             capture_endpoints,
-            exclude_object_id=req.target.object_id,
+            exclude_object_id=(None if self.support_aware else req.target.object_id),
         )
         capture_visibility = float(capture_visible.mean())
-        if capture_visibility < s.min_capture_visibility_fraction:
-            return None, "capture_corridor_occluded"
+        minimum_evidence_visibility = (
+            s.min_interaction_visibility_fraction
+            if self.support_aware
+            else s.min_capture_visibility_fraction
+        )
+        if capture_visibility < minimum_evidence_visibility:
+            return None, (
+                "interaction_region_occluded"
+                if self.support_aware
+                else "capture_corridor_occluded"
+            )
         fill = min(1.0, max(wh[0] / s.max_width_ratio, wh[1] / s.max_height_ratio))
         proximity = max(0.0, 1.0 - distance / s.max_camera_distance_m)
         remaining = 1.0 - s.distance_preference_weight
@@ -233,9 +282,14 @@ class ViewEvaluator:
         # capture region is only a weak per-camera preference because different
         # cameras are expected to cover complementary parts of that region.
         # Do not let capture visibility cap otherwise excellent target views.
-        composition = remaining * (
-            0.5 * visibility + 0.3 * fill + 0.2 * capture_visibility
-        ) + s.distance_preference_weight * proximity
+        if self.support_aware:
+            composition = remaining * (
+                0.25 * visibility + 0.30 * fill + 0.45 * capture_visibility
+            ) + s.distance_preference_weight * proximity
+        else:
+            composition = remaining * (
+                0.5 * visibility + 0.3 * fill + 0.2 * capture_visibility
+            ) + s.distance_preference_weight * proximity
         if composition < s.min_candidate_composition_score:
             return None, "composition_score_too_low"
         return {
@@ -243,8 +297,14 @@ class ViewEvaluator:
             "direction": unit(position - self.center),
             "bbox": [*low.tolist(), *high.tolist()],
             "visibility": visibility,
+            "strict_target_visibility": strict_visibility,
+            "support_discounted_target_fraction": float(support_only.mean()),
             "capture_visibility": capture_visibility,
             "capture_visible_mask": capture_visible,
+            "interaction_visibility": (
+                capture_visibility if self.support_aware else None
+            ),
+            "coverage_semantics": self.coverage_semantics,
             "fill": float(fill),
             "distance_m": distance,
             "height_above_floor_m": height,
@@ -871,10 +931,20 @@ def select_tour(evaluator, records):
                  + s.capture_set_coverage_weight * capture_set_coverage
                  + s.capture_multiview_weight * capture_multiview
                  + s.set_proximity_weight * proximity)
+        evidence_metrics = (
+            {
+                "interaction_set_coverage": capture_set_coverage,
+                "interaction_multiview_coverage": capture_multiview,
+            }
+            if evaluator.support_aware
+            else {
+                "capture_set_coverage": capture_set_coverage,
+                "capture_multiview_coverage": capture_multiview,
+            }
+        )
         return total, {"direction_coverage": coverage, "anchor_baseline": baseline,
                        "composition": composition, "worst_composition": worst_composition,
-                       "capture_set_coverage": capture_set_coverage,
-                       "capture_multiview_coverage": capture_multiview,
+                       **evidence_metrics,
                        "mean_proximity": proximity,
                        "elevation_diversity": elevation_diversity,
                        "min_pairwise_view_angle_degrees": minimum_angle,
@@ -956,6 +1026,8 @@ def select_tour(evaluator, records):
                    "hard_min_view_direction_separation_degrees": s.min_view_direction_separation_degrees,
                    "hard_min_azimuth_separation_degrees": s.min_azimuth_separation_degrees,
                    "hard_min_camera_position_separation_m": s.min_camera_position_separation_m,
+                   "coverage_evidence_semantics": evaluator.coverage_semantics,
+                   "support_aware": evaluator.support_aware,
                    "path_role": "feasibility and tie-break only"}
     if best is None:
         return None, None, diagnostics
@@ -990,12 +1062,21 @@ def plan_target_views(request, output, seed=0):
         "capture_corners_world_m": evaluator.corners.tolist(),
         "focus_world_m": evaluator.focus.tolist(),
         "visibility_semantics": (
-            "target visibility uses front-facing target-surface samples; capture visibility uses "
-            "the finite expanded target-box corridor and excludes target self-occlusion"
+            "target visibility discounts occlusion caused only by target-supported context objects; "
+            "unknown-human interaction samples still treat every object as solid"
+            if evaluator.support_aware
+            else "target visibility uses front-facing target-surface samples; capture visibility "
+            "uses the finite expanded target-box corridor and excludes target self-occlusion"
         ),
+        "coverage_evidence_semantics": evaluator.coverage_semantics,
+        "support_aware": evaluator.support_aware,
+        "supported_object_ids": sorted(evaluator.support_ids),
         "candidates": [{"camera_id": r["camera"].camera_id, "bbox_normalized": r["bbox"],
                         "visibility_fraction": r["visibility"], "composition": r["composition"],
+                        "strict_target_visibility_fraction": r["strict_target_visibility"],
+                        "support_discounted_target_fraction": r["support_discounted_target_fraction"],
                         "capture_visibility_fraction": r["capture_visibility"],
+                        "interaction_visibility_fraction": r["interaction_visibility"],
                         "fill": r["fill"], "distance_m": r["distance_m"],
                         "height_above_floor_m": r["height_above_floor_m"],
                         "azimuth_degrees": math.degrees(r["azimuth_rad"]),
@@ -1022,15 +1103,35 @@ def plan_target_views(request, output, seed=0):
     write_json(root / "camera_placements.json", {"length_unit": "meter", "cameras": [
         {"camera_id": c.camera_id, "position_world_m": c.center.tolist(),
          "view_direction_world": np.asarray(c.R)[2].tolist()} for c in cameras]})
-    # Keep preview compatible while removing hypothetical human/free-space point clouds entirely.
+    evidence_points = [evaluator.corners]
+    evidence_kinds = [np.full(len(evaluator.corners), 3, np.int8)]
+    if evaluator.support_aware:
+        region = request.interaction_region
+        free_anchors = np.asarray(region.free_anchor_points_world_m, dtype=float)
+        occupied_anchors = np.asarray(region.occupied_anchor_points_world_m, dtype=float)
+        interaction_points = np.asarray(region.sample_points_world_m, dtype=float)
+        for points, kind in (
+            (free_anchors, 4),
+            (occupied_anchors, 5),
+            (interaction_points, 6),
+        ):
+            if len(points):
+                evidence_points.append(points)
+                evidence_kinds.append(np.full(len(points), kind, np.int8))
     np.savez_compressed(
         root / "evidence.npz",
-        points=evaluator.corners,
-        kinds=np.full(len(evaluator.corners), 3, np.int8),
+        points=np.concatenate(evidence_points),
+        kinds=np.concatenate(evidence_kinds),
     )
     write_json(root / "observation_domain.json", {"mode": "target_viewspace", "human_scale_used": False,
-                "human_position_samples": 0,
-                "capture_region": "expanded_target_box_view_corridor",
+                "human_position_samples": len(evaluator.interaction_points),
+                "human_pose_predicted": False,
+                "capture_region": (
+                    "support_surface_free_volume_v1"
+                    if evaluator.support_aware
+                    else "expanded_target_box_view_corridor"
+                ),
+                "supported_object_ids": sorted(evaluator.support_ids),
                 "bbox_source": request.target_obb.method if request.target_obb else "aabb_fallback"})
     write_json(root / "post_generation_contract.json", {
         "scene_id": request.scene_id, "expected_subject": "one human static in world coordinates",
@@ -1048,7 +1149,7 @@ def plan_target_views(request, output, seed=0):
                             "visibility and transitions are finite samples; not exact pixel coverage",
                             "AABB backend can overestimate occlusion and closes concave free regions",
                             "OBB geometry axes do not identify semantic furniture front",
-                            "capture-box padding is geometric and does not predict a future pose",
+                            "interaction samples are geometry-only proxies and do not predict a future pose",
                               "azimuth/elevation/radius search is bounded and may miss a narrow feasible region",
                               "generated video must be checked before inheriting calibrated cameras"]}
     write_json(root / "camera_plan_result.json", result)

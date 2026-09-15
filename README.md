@@ -1,10 +1,10 @@
 # 家具条件下的相机布局规划 — YSynthetic 外置研究原型
 
-当前主线（2026-09-12）：**目标家具构图约束 → 自适应视点域 → 联合选位与开放运镜 → 生成人物后选择实际关键帧**。
+当前主线（2026-09-15）：**目标/附属物体/其他障碍三类几何角色 → 自由交互区域 → 自适应视点域 → 多视角集合选择与开放运镜 → 生成人物后选择实际关键帧**。
 
-本次按用户要求只修改代码，**没有运行测试、规划或 Blender 渲染**。具体入口与限制见 [目标视点域实现说明](docs/TARGET_VIEWSPACE.zh-CN.md)。
+本次完成了轻量单元测试，**没有运行完整规划或 Blender 大场景渲染**。具体入口与限制见 [目标视点域实现说明](docs/TARGET_VIEWSPACE.zh-CN.md)和[目标附属物体与自由交互区域](docs/SUPPORT_AWARE.zh-CN.md)。
 
-当前真实场景配置是 `configs/test1_sofa_clean.yaml`，`planning_mode: target_viewspace`，独立输出为 `D:/camera/testoutput/test1_target_viewspace`。生成前不再创建人体附近自由空间点云；保留家具构图角点与相机/路径诊断。第二阶段 `select-human-frames` 消费外部检测与背景相机验证结果，不会自动调用视频模型或人体检测网络。
+`planning_mode: target_viewspace` 在没有检测到附属物体时保留原 capture-box 证据；检测到桌面附属物体时，改用不与场景几何冲突的未知人体自由交互代理。第二阶段 `select-human-frames` 消费外部检测与背景相机验证结果，不会自动调用视频模型或人体检测网络。
 
 下面的 `robust_space`、RQ1 和历史能力记录属于此前兼容分支；不代表新主线已经验证通过。0.4.0（2026-09-09）的自由空间方案仍可用于对照。
 
@@ -31,13 +31,14 @@ uv sync --extra dev --extra solver
 ## 建议阅读顺序
 
 1. [整体设计](docs/DESIGN.zh-CN.md)：问题定义、每一步算法、为什么这样设计。
-2. [论文与取舍](docs/LITERATURE.zh-CN.md)：已核对的一手文献、精读/复现顺序、哪些不能直接照搬。
-3. [YSynthetic 对接](docs/INTEGRATION.zh-CN.md)：真实 K/R/T、scene、body-fit 和融合接口。
-4. [RQ1 实验操作](docs/RQ1.zh-CN.md)：如何从规划到参考人体回环测试，尚需手动完成什么。
-5. [阶段计划](docs/ROADMAP.zh-CN.md)：已经实现与下一步验收条件。
-6. [本机验证记录](docs/VALIDATION.zh-CN.md)：本次真正运行了什么，没运行什么。
-7. [从 Blender 开始的一键操作](docs/QUICKSTART.zh-CN.md)：真实场景要准备什么、运行哪条命令、怎么看输出。
-8. [完整测试指南](docs/TESTING.zh-CN.md)：从选择家具对象到查看相机与 PNG 的逐步操作。
+2. [目标附属物体与自由交互区域](docs/SUPPORT_AWARE.zh-CN.md)：桌面物体三类角色、自由区和评分语义。
+3. [论文与取舍](docs/LITERATURE.zh-CN.md)：已核对的一手文献、精读/复现顺序、哪些不能直接照搬。
+4. [YSynthetic 对接](docs/INTEGRATION.zh-CN.md)：真实 K/R/T、scene、body-fit 和融合接口。
+5. [RQ1 实验操作](docs/RQ1.zh-CN.md)：如何从规划到参考人体回环测试，尚需手动完成什么。
+6. [阶段计划](docs/ROADMAP.zh-CN.md)：已经实现与下一步验收条件。
+7. [本机验证记录](docs/VALIDATION.zh-CN.md)：本次真正运行了什么，没运行什么。
+8. [从 Blender 开始的一键操作](docs/QUICKSTART.zh-CN.md)：真实场景要准备什么、运行哪条命令、怎么看输出。
+9. [完整测试指南](docs/TESTING.zh-CN.md)：从选择家具对象到查看相机与 PNG 的逐步操作。
 
 ## 当前实际能力
 

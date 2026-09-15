@@ -20,11 +20,13 @@ from .contracts import (
     ScoreSettings,
     StrictModel,
     TargetViewSettings,
+    Box,
 )
 from .controls import prepare_constant_scene_control
 from .experiments import prepare_rq1
 from .integration import command_plan
 from .planner import load_request, plan
+from .support import build_interaction_region, detect_supported_objects
 
 
 class IntegrationSettings(StrictModel):
@@ -384,6 +386,34 @@ def _write_box_request(config, boxes_path, request_path):
         if config.floor_height_m is not None
         else min(record["minimum_m"][2] for record in records if record["role"] != "allowed_region")
     )
+    target_box = Box(
+        object_id=target["object_id"],
+        minimum=target["minimum_m"],
+        maximum=target["maximum_m"],
+    )
+    obstacle_boxes = [
+        Box(
+            object_id=record["object_id"],
+            minimum=record["minimum_m"],
+            maximum=record["maximum_m"],
+        )
+        for record in records
+        if record["role"] == "obstacle"
+    ]
+    supported, ordinary_obstacles, support_graph = detect_supported_objects(
+        target_box,
+        obstacle_boxes,
+        config.target_view,
+        up_index=2,
+    )
+    interaction_region, interaction_manifest = build_interaction_region(
+        target_box,
+        (manifest.get("target_asset") or {}).get("obb"),
+        supported,
+        ordinary_obstacles,
+        config.target_view,
+        up_index=2,
+    )
     request = PlanningRequest.model_validate(
         {
             "schema_version": "camera_planning_request_v2",
@@ -395,19 +425,13 @@ def _write_box_request(config, boxes_path, request_path):
             "planning_mode": config.planning_mode,
             "target_view": config.target_view.model_dump(mode="json"),
             "target_obb": (manifest.get("target_asset") or {}).get("obb"),
-            "target": {
-                "object_id": target["object_id"],
-                "minimum": target["minimum_m"],
-                "maximum": target["maximum_m"],
-            },
+            "target": target_box.model_dump(mode="json"),
+            "supported_objects": [box.model_dump(mode="json") for box in supported],
+            "interaction_region": (
+                interaction_region.model_dump(mode="json") if interaction_region else None
+            ),
             "obstacles": [
-                {
-                    "object_id": record["object_id"],
-                    "minimum": record["minimum_m"],
-                    "maximum": record["maximum_m"],
-                }
-                for record in records
-                if record["role"] == "obstacle"
+                box.model_dump(mode="json") for box in ordinary_obstacles
             ],
             "allowed_camera_region": {
                 "object_id": allowed_id,
@@ -424,6 +448,8 @@ def _write_box_request(config, boxes_path, request_path):
         }
     )
     write_json(request_path, request.model_dump(mode="json"))
+    write_json(Path(request_path).parent / "support_graph.json", support_graph)
+    write_json(Path(request_path).parent / "interaction_region.json", interaction_manifest)
 
 
 def run_pilot(config_path):
